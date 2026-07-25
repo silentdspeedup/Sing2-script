@@ -11,7 +11,9 @@ Type=simple
 LimitAS=infinity
 LimitRSS=infinity
 LimitCORE=infinity
-# 代理节点的连接数就是文件描述符数，默认 1024 会在几百用户时静默耗尽。
+# A proxy node's connection count IS its fd count; the default 1024 runs out
+# silently at a few hundred users. Kept ASCII-only on purpose: unit files are
+# parsed by PID 1 and some systemd builds are unhappy with non-ASCII content.
 LimitNOFILE=999999
 WorkingDirectory=/usr/local/Sing2/
 ExecStart=/usr/local/Sing2/sing2 serve --config /etc/Sing2/config.yml

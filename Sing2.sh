@@ -245,9 +245,11 @@ update_shell() {
 # 一个写坏/写空/未 daemon-reload 的 unit 文件会让文件判断说"已安装、未运行"，
 # 而 systemctl start 说 "Unit not found" —— 两个结论互相矛盾，运维无从下手。
 check_status() {
-    if ! systemctl list-unit-files 2>/dev/null | grep -q "^${SERVICE}\.service"; then
-        return 2
-    fi
+    local unitline
+    unitline=$(systemctl list-unit-files 2>/dev/null | grep "^${SERVICE}\.service" | head -1)
+    # 空 = 没登记；含 bad = 文件在但 systemd 解析不了。两者都算"没装好"，
+    # 否则就会出现「菜单说未运行、start 说 not found」的自相矛盾。
+    [[ -z "$unitline" || "$unitline" == *bad* ]] && return 2
     local temp
     temp=$(systemctl is-active ${SERVICE} 2>/dev/null)
     [[ x"${temp}" == x"active" ]] && return 0 || return 1
@@ -273,7 +275,11 @@ diagnose_missing_unit() {
         if [[ "${first}" == *$'\r' ]]; then
             echo -e "    ${yellow}→ 文件是 CRLF 行尾${plain}，systemd 解析不了"
         fi
+        echo -e "    → SELinux 上下文不对（从 /tmp 拷进来的文件 PID 1 读不了）"
+        echo -e "       当前：$(ls -Z /etc/systemd/system/${SERVICE}.service 2>/dev/null | awk '{print $1}')"
+        echo -e "       SELinux：$(getenforce 2>/dev/null || echo 'N/A')"
         echo -e "    → 或者装完没执行 systemctl daemon-reload"
+        echo -e "  systemd 记录的状态：$(systemctl list-unit-files 2>/dev/null | grep "^${SERVICE}\.service" || echo '未登记')"
         echo
         echo -e "  文件前几行："
         sed -n '1,6p' /etc/systemd/system/${SERVICE}.service | sed 's/^/    /'

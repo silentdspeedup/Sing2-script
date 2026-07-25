@@ -94,7 +94,12 @@ echo -e "架构：${green}${arch}${plain}"
 #     "Unit not found" —— 正是最难排查的那种状态。
 fetch() {
     local url=$1 dest=$2 tmpf
-    tmpf=$(mktemp) || return 1
+    # 临时文件建在**目标同目录**，不要用 /tmp。
+    # mv 会把源文件的 SELinux 上下文一起搬过去；从 /tmp 搬进 /etc/systemd/system 的
+    # 文件会带着 user_tmp_t 标签落地，PID 1 读不了，systemd 就把这个 unit 记成 bad
+    # （表现正是「list-unit-files 里有、systemctl status 说 not found」）。
+    # 建在同目录则由策略的 type_transition 给出正确标签。
+    tmpf=$(mktemp "${dest}.XXXXXX" 2>/dev/null) || tmpf=$(mktemp) || return 1
     if command -v curl >/dev/null 2>&1; then
         curl -fsSL --retry 3 --connect-timeout 15 -o "$tmpf" "$url" || { rm -f "$tmpf"; return 1; }
     elif command -v wget >/dev/null 2>&1; then
@@ -106,6 +111,99 @@ fetch() {
     [[ -s "$tmpf" ]] || { rm -f "$tmpf"; return 1; }   # 空文件视为失败
     mv -f "$tmpf" "$dest" || { rm -f "$tmpf"; return 1; }
     return 0
+}
+
+# unit_is_registered —— 以 systemd 自己的说法为准。
+# 注意 `list-unit-files` 会把「文件在但解析不了」的 unit 报成状态 bad，那同样算
+# 没装好，所以这里要求状态不是 bad。
+unit_is_registered() {
+    local line
+    line=$(systemctl list-unit-files 2>/dev/null | grep '^Sing2\.service' | head -1)
+    [[ -n "$line" ]] || return 1
+    [[ "$line" != *bad* ]] || return 1
+    return 0
+}
+
+# write_builtin_unit 是自愈兜底：把一份已知可用的 unit 直接写到位。
+# 刻意全 ASCII —— unit 文件由 PID 1 解析，个别 systemd 构建对非 ASCII 内容不友好。
+write_builtin_unit() {
+    rm -f /etc/systemd/system/Sing2.service
+    cat > /etc/systemd/system/Sing2.service <<'UNIT'
+[Unit]
+Description=Sing2 Service
+Documentation=https://github.com/silentdspeedup/Sing2
+After=network.target nss-lookup.target
+Wants=network.target
+
+[Service]
+User=root
+Group=root
+Type=simple
+LimitAS=infinity
+LimitRSS=infinity
+LimitCORE=infinity
+LimitNOFILE=999999
+WorkingDirectory=/usr/local/Sing2/
+ExecStart=/usr/local/Sing2/sing2 serve --config /etc/Sing2/config.yml
+Restart=on-failure
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target
+UNIT
+}
+
+# relabel —— SELinux 环境下必须做。
+# 从 /tmp 拷进 /etc/systemd/system 的文件可能带着 tmp 的安全上下文，PID 1 读不了，
+# systemd 就把这个 unit 记成 bad（表现是 list-unit-files 里有、status 说 not found）。
+# 非 SELinux 系统上这两条命令不存在或无害。
+relabel_unit() {
+    if command -v restorecon >/dev/null 2>&1; then
+        restorecon -F /etc/systemd/system/Sing2.service >/dev/null 2>&1
+    elif command -v chcon >/dev/null 2>&1; then
+        chcon -t systemd_unit_file_t /etc/systemd/system/Sing2.service >/dev/null 2>&1
+    fi
+}
+
+# install_unit 把 unit 装好并**验证 systemd 真的能用它**，不行就自愈重写。
+# 只写文件不验证，会把「装了但起不来」这种最难查的状态留给用户。
+install_unit() {
+    local src=$1
+
+    rm -f /etc/systemd/system/Sing2.service
+    if [[ -f "$src" ]]; then
+        install -m 644 "$src" /etc/systemd/system/Sing2.service
+    elif ! fetch "https://raw.githubusercontent.com/${SCRIPT_REPO}/master/Sing2.service" \
+        /etc/systemd/system/Sing2.service; then
+        echo -e "${yellow}获取 Sing2.service 失败，改用内置版本${plain}"
+        write_builtin_unit
+    fi
+    chmod 644 /etc/systemd/system/Sing2.service
+    relabel_unit
+    systemctl daemon-reload
+
+    if unit_is_registered; then
+        return 0
+    fi
+
+    # 第一次没成：换内置 ASCII 版本 + 重新打标签再试一次。
+    echo -e "${yellow}systemd 未接受该 unit 文件，改用内置版本重试……${plain}"
+    write_builtin_unit
+    chmod 644 /etc/systemd/system/Sing2.service
+    relabel_unit
+    systemctl daemon-reload
+
+    if unit_is_registered; then
+        echo -e "${green}内置 unit 生效${plain}"
+        return 0
+    fi
+
+    echo -e "${red}systemd 仍不接受 Sing2.service${plain}"
+    echo -e "  状态：$(systemctl list-unit-files 2>/dev/null | grep '^Sing2\.service' || echo '未登记')"
+    echo -e "  SELinux：$(getenforce 2>/dev/null || echo 'N/A')"
+    echo -e "  上下文：$(ls -Z /etc/systemd/system/Sing2.service 2>/dev/null)"
+    echo -e "  请把以上输出连同 ${green}journalctl -b -u systemd --no-pager | tail -30${plain} 一起反馈"
+    exit 1
 }
 
 install_base() {
@@ -171,28 +269,7 @@ install_Sing2() {
     mkdir -p "${INSTALL_DIR}" "${CONF_DIR}"
     install -m 755 "${tmp}/unpacked/sing2" "${INSTALL_DIR}/sing2"
 
-    # systemd unit：优先用压缩包里的（离线可用），拿不到再回落到脚本仓库
-    if [[ -f "${tmp}/unpacked/Sing2.service" ]]; then
-        install -m 644 "${tmp}/unpacked/Sing2.service" /etc/systemd/system/Sing2.service
-    elif ! fetch "https://raw.githubusercontent.com/${SCRIPT_REPO}/master/Sing2.service" \
-        /etc/systemd/system/Sing2.service; then
-        echo -e "${red}获取 Sing2.service 失败${plain}"
-        exit 1
-    fi
-    chmod 644 /etc/systemd/system/Sing2.service
-
-    systemctl daemon-reload
-
-    # 校验 systemd 确实登记了这个 unit。不验的话，一个写坏/写空的 unit 文件会让
-    # 后续所有「文件在不在」式的判断都误报"已安装"，而 systemctl 一直说 not found
-    # —— 正是最难排查的那种状态。
-    if ! systemctl list-unit-files 2>/dev/null | grep -q '^Sing2\.service'; then
-        echo -e "${red}systemd 未能识别 Sing2.service${plain}"
-        echo -e "  unit 文件前几行："
-        sed -n '1,6p' /etc/systemd/system/Sing2.service 2>/dev/null | sed 's/^/    /'
-        echo -e "  请连同 ${green}systemctl status Sing2${plain} 的输出一起反馈"
-        exit 1
-    fi
+    install_unit "${tmp}/unpacked/Sing2.service"
 
     systemctl enable Sing2 >/dev/null 2>&1
     echo -e "${green}Sing2 ${last_version}${plain} 安装完成，已设置开机自启"
