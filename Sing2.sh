@@ -1,0 +1,611 @@
+#!/usr/bin/env bash
+# SPDX-License-Identifier: GPL-3.0-or-later
+#
+# Sing2 管理脚本。安装后位于 /usr/bin/sing2（并软链 /usr/bin/Sing2）。
+#
+# 布局：
+#   /usr/local/Sing2/sing2   二进制
+#   /etc/Sing2/config.yml    配置
+#   Sing2.service            systemd 单元
+
+red='\033[0;31m'
+green='\033[0;32m'
+yellow='\033[0;33m'
+plain='\033[0m'
+
+REPO="silentdspeedup/Sing2"
+SCRIPT_REPO="silentdspeedup/Sing2-script"
+BIN="/usr/local/Sing2/sing2"
+CONF_DIR="/etc/Sing2"
+CONF="${CONF_DIR}/config.yml"
+SERVICE="Sing2"
+
+[[ $EUID -ne 0 ]] && echo -e "${red}错误：${plain} 必须以 root 运行此脚本\n" && exit 1
+
+# ---------- 系统识别 ----------
+if [[ -f /etc/redhat-release ]]; then
+    release="centos"
+elif grep -Eqi "debian" /etc/issue 2>/dev/null; then
+    release="debian"
+elif grep -Eqi "ubuntu" /etc/issue 2>/dev/null; then
+    release="ubuntu"
+elif grep -Eqi "centos|red hat|redhat|rocky|alma|oracle linux" /etc/issue 2>/dev/null; then
+    release="centos"
+elif grep -Eqi "debian" /proc/version 2>/dev/null; then
+    release="debian"
+elif grep -Eqi "ubuntu" /proc/version 2>/dev/null; then
+    release="ubuntu"
+elif grep -Eqi "centos|red hat|redhat|rocky|alma|oracle linux" /proc/version 2>/dev/null; then
+    release="centos"
+else
+    echo -e "${red}未能识别系统版本${plain}\n" && exit 1
+fi
+
+confirm() {
+    if [[ $# -gt 1 ]]; then
+        echo && read -rp "$1 [默认$2]: " temp
+        [[ x"${temp}" == x"" ]] && temp=$2
+    else
+        read -rp "$1 [y/n]: " temp
+    fi
+    [[ x"${temp}" == x"y" || x"${temp}" == x"Y" ]] && return 0 || return 1
+}
+
+confirm_restart() {
+    confirm "是否重启 Sing2" "y"
+    if [[ $? == 0 ]]; then
+        restart
+    else
+        show_menu
+    fi
+}
+
+before_show_menu() {
+    echo && echo -n -e "${yellow}按回车返回主菜单: ${plain}" && read -r temp
+    show_menu
+}
+
+install() {
+    bash <(curl -Ls "https://raw.githubusercontent.com/${SCRIPT_REPO}/master/install.sh")
+    if [[ $? == 0 ]]; then
+        if [[ $# == 0 ]]; then
+            start
+        else
+            start 0
+        fi
+    fi
+}
+
+update() {
+    if [[ $# == 0 ]]; then
+        echo && echo -n -e "输入指定版本(默认最新版): " && read -r version
+    else
+        version=$2
+    fi
+    bash <(curl -Ls "https://raw.githubusercontent.com/${SCRIPT_REPO}/master/install.sh") "$version"
+    if [[ $? == 0 ]]; then
+        echo -e "${green}更新完成，已自动重启 Sing2，请用 sing2 log 查看运行日志${plain}"
+        exit
+    fi
+    [[ $# == 0 ]] && before_show_menu
+}
+
+config() {
+    echo "编辑配置文件后将自动重启 Sing2"
+    ${EDITOR:-vi} "${CONF}"
+    sleep 2
+    check_status
+    case $? in
+        0) echo -e "Sing2 状态: ${green}已运行${plain}" ;;
+        1)
+            echo -e "检测到您未启动 Sing2 或 Sing2 自动重启失败，是否查看日志？[Y/n]" && read -r yn
+            if [[ x"${yn}" =~ ^[Yy]$ || -z "${yn}" ]]; then
+                show_log
+            fi
+            ;;
+        2) echo -e "Sing2 状态: ${red}未安装${plain}" ;;
+    esac
+    [[ $# == 0 ]] && before_show_menu
+}
+
+uninstall() {
+    confirm "确定要卸载 Sing2 吗？" "n"
+    [[ $? != 0 ]] && { [[ $# == 0 ]] && show_menu; return 0; }
+
+    systemctl stop ${SERVICE}
+    systemctl disable ${SERVICE}
+    rm -f /etc/systemd/system/${SERVICE}.service
+    systemctl daemon-reload
+    systemctl reset-failed
+    rm -rf /usr/local/Sing2/
+    rm -f /usr/bin/sing2 /usr/bin/Sing2
+
+    echo ""
+    echo -e "${green}卸载成功${plain}"
+    echo -e "${yellow}配置目录 ${CONF_DIR} 已保留${plain}（含 config.yml 与证书）。"
+    echo -e "如需彻底清除：${green}rm -rf ${CONF_DIR}${plain}"
+    echo ""
+    [[ $# == 0 ]] && before_show_menu
+}
+
+start() {
+    check_status
+    if [[ $? == 0 ]]; then
+        echo -e "${green}Sing2 已在运行，无需再次启动${plain}"
+    else
+        systemctl start ${SERVICE}
+        sleep 2
+        check_status
+        if [[ $? == 0 ]]; then
+            echo -e "${green}Sing2 启动成功，请用 sing2 log 查看运行日志${plain}"
+        else
+            echo -e "${red}Sing2 启动失败${plain}，请用 sing2 log 查看日志"
+        fi
+    fi
+    [[ $# == 0 ]] && before_show_menu
+}
+
+stop() {
+    systemctl stop ${SERVICE}
+    sleep 2
+    check_status
+    if [[ $? == 1 ]]; then
+        echo -e "${green}Sing2 停止成功${plain}"
+    else
+        echo -e "${red}Sing2 停止失败${plain}，请用 sing2 log 查看日志"
+    fi
+    [[ $# == 0 ]] && before_show_menu
+}
+
+restart() {
+    systemctl restart ${SERVICE}
+    sleep 2
+    check_status
+    if [[ $? == 0 ]]; then
+        echo -e "${green}Sing2 重启成功，请用 sing2 log 查看运行日志${plain}"
+    else
+        echo -e "${red}Sing2 重启失败${plain}，请用 sing2 log 查看日志"
+    fi
+    [[ $# == 0 ]] && before_show_menu
+}
+
+status() {
+    systemctl status ${SERVICE} --no-pager -l
+    [[ $# == 0 ]] && before_show_menu
+}
+
+enable() {
+    systemctl enable ${SERVICE}
+    if [[ $? == 0 ]]; then
+        echo -e "${green}Sing2 设置开机自启成功${plain}"
+    else
+        echo -e "${red}Sing2 设置开机自启失败${plain}"
+    fi
+    [[ $# == 0 ]] && before_show_menu
+}
+
+disable() {
+    systemctl disable ${SERVICE}
+    if [[ $? == 0 ]]; then
+        echo -e "${green}Sing2 取消开机自启成功${plain}"
+    else
+        echo -e "${red}Sing2 取消开机自启失败${plain}"
+    fi
+    [[ $# == 0 ]] && before_show_menu
+}
+
+show_log() {
+    journalctl -u ${SERVICE}.service -e --no-pager -f
+    [[ $# == 0 ]] && before_show_menu
+}
+
+install_bbr() {
+    bash <(curl -L -s https://raw.githubusercontent.com/chiakge/Linux-NetSpeed/master/tcp.sh)
+}
+
+update_shell() {
+    wget -O /usr/bin/sing2 -N --no-check-certificate \
+        "https://raw.githubusercontent.com/${SCRIPT_REPO}/master/Sing2.sh"
+    if [[ $? != 0 ]]; then
+        echo ""
+        echo -e "${red}下载脚本失败，请检查本机能否连接 GitHub${plain}"
+        before_show_menu
+    else
+        chmod +x /usr/bin/sing2
+        ln -sf /usr/bin/sing2 /usr/bin/Sing2
+        echo -e "${green}升级脚本成功，请重新运行脚本${plain}" && exit 0
+    fi
+}
+
+# 0: running, 1: not running, 2: not installed
+check_status() {
+    [[ ! -f /etc/systemd/system/${SERVICE}.service ]] && return 2
+    local temp
+    temp=$(systemctl is-active ${SERVICE} 2>/dev/null)
+    [[ x"${temp}" == x"active" ]] && return 0 || return 1
+}
+
+check_enabled() {
+    local temp
+    temp=$(systemctl is-enabled ${SERVICE} 2>/dev/null)
+    [[ x"${temp}" == x"enabled" ]] && return 0 || return 1
+}
+
+check_uninstall() {
+    check_status
+    if [[ $? != 2 ]]; then
+        echo ""
+        echo -e "${red}Sing2 已安装，请勿重复安装${plain}"
+        [[ $# == 0 ]] && before_show_menu
+        return 1
+    fi
+    return 0
+}
+
+check_install() {
+    check_status
+    if [[ $? == 2 ]]; then
+        echo ""
+        echo -e "${red}请先安装 Sing2${plain}"
+        [[ $# == 0 ]] && before_show_menu
+        return 1
+    fi
+    return 0
+}
+
+show_status() {
+    check_status
+    case $? in
+        0)
+            echo -e "Sing2 状态: ${green}已运行${plain}"
+            show_enable_status
+            ;;
+        1)
+            echo -e "Sing2 状态: ${yellow}未运行${plain}"
+            show_enable_status
+            ;;
+        2) echo -e "Sing2 状态: ${red}未安装${plain}" ;;
+    esac
+}
+
+show_enable_status() {
+    check_enabled
+    if [[ $? == 0 ]]; then
+        echo -e "是否开机自启: ${green}是${plain}"
+    else
+        echo -e "是否开机自启: ${red}否${plain}"
+    fi
+}
+
+show_Sing2_version() {
+    echo -n "Sing2 版本："
+    ${BIN} version
+    echo ""
+    [[ $# == 0 ]] && before_show_menu
+}
+
+# REALITY 密钥对：私钥留本节点，公钥填面板。
+# 面板的 server 串同时用于渲染用户订阅，私钥进面板就等于发给每个客户端。
+gen_x25519() {
+    if [[ ! -x ${BIN} ]]; then
+        echo -e "${red}未找到 ${BIN}，请先安装 Sing2${plain}"
+        [[ $# == 0 ]] && before_show_menu
+        return 1
+    fi
+    echo ""
+    ${BIN} x25519
+    echo ""
+    [[ $# == 0 ]] && before_show_menu
+}
+
+generate_config_file() {
+    echo -e "${yellow}Sing2 配置文件生成向导${plain}"
+    echo -e "${red}注意事项：${plain}"
+    echo -e "${red}1. 生成的配置会写入 ${CONF}${plain}"
+    echo -e "${red}2. 原配置会备份为 ${CONF}.bak${plain}"
+    echo -e "${red}3. 向导只覆盖常用项，完整字段见 doc/09-config-and-migration.md${plain}"
+    read -rp "是否继续？(y/n) " go_on
+    if [[ ! $go_on =~ ^[yY]$ ]]; then
+        echo -e "${red}已取消${plain}"
+        [[ $# == 0 ]] && before_show_menu
+        return 0
+    fi
+
+    # 面板：Sing2 只支持 SSpanel（mod_mu 系）。传统 SSpanel 与 Phoenix 都属这一类，
+    # 节点端按面板响应的形状自动分派，无需在此区分。
+    echo -e "${yellow}面板类型：Sing2 仅支持 SSpanel（mod_mu 系，含传统版与 custom_config 版）${plain}"
+    PanelType="SSpanel"
+
+    read -rp "请输入面板地址（如 https://panel.example.com）：" ApiHost
+    read -rp "请输入面板对接 API Key：" ApiKey
+    read -rp "请输入节点 ID：" NodeID
+
+    echo -e "${yellow}请选择节点协议：${plain}"
+    echo -e "${green}1.${plain} V2ray      （VMess / VLESS，由面板 enable_vless 决定）"
+    echo -e "${green}2.${plain} Vless"
+    echo -e "${green}3.${plain} Trojan"
+    echo -e "${green}4.${plain} Shadowsocks"
+    echo -e "${green}5.${plain} Mieru"
+    echo -e "${green}6.${plain} TrustTunnel"
+    read -rp "请输入 [1-6，默认 1]：" nt
+    case "$nt" in
+        2) NodeType="Vless" ;;
+        3) NodeType="Trojan" ;;
+        4) NodeType="Shadowsocks" ;;
+        5) NodeType="Mieru" ;;
+        6) NodeType="TrustTunnel" ;;
+        *) NodeType="V2ray" ;;
+    esac
+
+    EnableVless="false"
+    VlessFlow=""
+    if [[ "$NodeType" == "V2ray" ]]; then
+        confirm "该节点是否为 VLESS？（否则为 VMess）" "n"
+        [[ $? == 0 ]] && EnableVless="true"
+    fi
+    if [[ "$NodeType" == "Vless" || "$EnableVless" == "true" ]]; then
+        confirm "是否启用 XTLS Vision（flow=xtls-rprx-vision）" "y"
+        [[ $? == 0 ]] && VlessFlow="xtls-rprx-vision"
+    fi
+
+    # REALITY：私钥必须节点本地持有
+    EnableREALITY="false"
+    RealityDest="www.microsoft.com:443"
+    RealitySNI="www.microsoft.com"
+    RealityPrivKey=""
+    RealityShortId=""
+    if [[ "$NodeType" == "Vless" || "$EnableVless" == "true" ]]; then
+        confirm "是否启用 REALITY" "n"
+        if [[ $? == 0 ]]; then
+            EnableREALITY="true"
+            read -rp "REALITY 回落目标 [默认 www.microsoft.com:443]：" tmp
+            [[ -n "$tmp" ]] && RealityDest="$tmp"
+            read -rp "REALITY SNI（须与回落目标一致）[默认 www.microsoft.com]：" tmp
+            [[ -n "$tmp" ]] && RealitySNI="$tmp"
+            read -rp "REALITY ShortId（面板若已配置请填相同值，留空表示不限）：" RealityShortId
+            echo -e "${yellow}正在生成 REALITY 密钥对……${plain}"
+            if [[ -x ${BIN} ]]; then
+                local kp
+                kp=$(${BIN} x25519)
+                echo "$kp"
+                RealityPrivKey=$(echo "$kp" | awk '/PrivateKey:/{print $2}')
+                echo -e "${green}私钥已写入配置；请把上面的 PublicKey 填到面板${plain}"
+            else
+                echo -e "${red}未找到 ${BIN}，请稍后手动执行 sing2 x25519 并填入 PrivateKey${plain}"
+            fi
+        fi
+    fi
+
+    # 证书
+    echo -e "${yellow}证书模式：${plain}"
+    echo -e "${green}1.${plain} none  不启用 TLS（REALITY / Mieru 选这个）"
+    echo -e "${green}2.${plain} file  使用本地证书文件"
+    echo -e "${green}3.${plain} dns   ACME DNS-01 自动申请"
+    echo -e "${green}4.${plain} http  ACME HTTP-01 自动申请（需 80 端口可达）"
+    read -rp "请输入 [1-4，默认 1]：" cm
+    case "$cm" in
+        2) CertMode="file" ;;
+        3) CertMode="dns" ;;
+        4) CertMode="http" ;;
+        *) CertMode="none" ;;
+    esac
+    CertDomain=""
+    CertEmail=""
+    CertProvider="cloudflare"
+    if [[ "$CertMode" != "none" ]]; then
+        read -rp "请输入证书域名：" CertDomain
+    fi
+    if [[ "$CertMode" == "dns" || "$CertMode" == "http" ]]; then
+        read -rp "请输入 ACME 邮箱：" CertEmail
+    fi
+    if [[ "$CertMode" == "dns" ]]; then
+        read -rp "请输入 DNS provider [默认 cloudflare]：" tmp
+        [[ -n "$tmp" ]] && CertProvider="$tmp"
+        read -rp "请输入 Cloudflare API Token（其它 provider 请稍后手改 DNSEnv）：" CFToken
+    fi
+
+    mkdir -p "${CONF_DIR}"
+    [[ -f "${CONF}" ]] && mv "${CONF}" "${CONF}.bak"
+
+    {
+        cat <<EOF
+Log:
+  Level: warning # none / error / warning / info / debug
+  AccessPath: # ${CONF_DIR}/access.log
+  ErrorPath: # ${CONF_DIR}/error.log
+
+AccessLog:
+  Enable: false # 面板需实现 POST /mod_mu/users/accesslog
+
+Nodes:
+  - PanelType: "${PanelType}"
+    ApiConfig:
+      ApiHost: "${ApiHost}"
+      ApiKey: "${ApiKey}"
+      NodeID: ${NodeID}
+      NodeType: ${NodeType}
+      Timeout: 30
+      EnableVless: ${EnableVless}
+EOF
+        [[ -n "$VlessFlow" ]] && echo "      VlessFlow: ${VlessFlow}"
+        cat <<EOF
+      SpeedLimit: 0 # Mbps，0 = 不限（本地设置会覆盖面板下发）
+      DeviceLimit: 0 # 0 = 不限
+      RuleListPath: # ${CONF_DIR}/rulelist
+      DisableCustomConfig: false # true = 强制走旧版 server 串解析
+    ControllerConfig:
+      ListenIP: 0.0.0.0
+      SendIP: 0.0.0.0
+      UpdatePeriodic: 60
+      EnableDNS: false
+      DNSType: AsIs
+      EnableProxyProtocol: false
+      EnableFallback: false
+      EnableREALITY: ${EnableREALITY}
+EOF
+        if [[ "$EnableREALITY" == "true" ]]; then
+            cat <<EOF
+      DisableLocalREALITYConfig: false
+      REALITYConfigs:
+        Show: false
+        Dest: ${RealityDest}
+        ProxyProtocolVer: 0
+        ServerNames:
+          - ${RealitySNI}
+        PrivateKey: ${RealityPrivKey}
+        MaxTimeDiff: 0
+        ShortIds:
+          - "${RealityShortId}"
+EOF
+        fi
+        cat <<EOF
+      AutoSpeedLimitConfig:
+        Limit: 0 # Mbps，0 = 关闭动态限速
+        WarnTimes: 0
+        LimitSpeed: 0
+        LimitDuration: 0
+      GlobalDeviceLimitConfig:
+        Enable: false
+      ConnLimitConfig:
+        Enable: false
+        MaxConnPerUser: 0
+      CertConfig:
+        CertMode: ${CertMode}
+EOF
+        [[ -n "$CertDomain" ]] && echo "        CertDomain: \"${CertDomain}\""
+        if [[ "$CertMode" == "file" ]]; then
+            echo "        CertFile: ${CONF_DIR}/cert/${CertDomain}.crt"
+            echo "        KeyFile: ${CONF_DIR}/cert/${CertDomain}.key"
+        fi
+        if [[ "$CertMode" == "dns" || "$CertMode" == "http" ]]; then
+            echo "        Email: \"${CertEmail}\""
+        fi
+        if [[ "$CertMode" == "dns" ]]; then
+            echo "        Provider: ${CertProvider}"
+            echo "        DNSEnv:"
+            echo "          CLOUDFLARE_DNS_API_TOKEN: \"${CFToken}\""
+        fi
+    } > "${CONF}"
+
+    chmod 600 "${CONF}"
+    echo -e "${green}配置已生成：${CONF}${plain}"
+    if [[ "$EnableREALITY" == "true" && -n "$RealityPrivKey" ]]; then
+        echo -e "${yellow}提醒：REALITY 私钥只在本节点，面板只需填公钥。${plain}"
+    fi
+    echo -e "正在重启 Sing2 ……"
+    restart 0
+    [[ $# == 0 ]] && before_show_menu
+}
+
+open_ports() {
+    systemctl stop firewalld.service 2>/dev/null
+    systemctl disable firewalld.service 2>/dev/null
+    setenforce 0 2>/dev/null
+    ufw disable 2>/dev/null
+    iptables -P INPUT ACCEPT 2>/dev/null
+    iptables -P FORWARD ACCEPT 2>/dev/null
+    iptables -P OUTPUT ACCEPT 2>/dev/null
+    iptables -t nat -F 2>/dev/null
+    iptables -t mangle -F 2>/dev/null
+    iptables -F 2>/dev/null
+    iptables -X 2>/dev/null
+    netfilter-persistent save 2>/dev/null
+    echo -e "${green}已放开防火墙端口${plain}"
+    [[ $# == 0 ]] && before_show_menu
+}
+
+show_usage() {
+    echo "Sing2 管理脚本用法（sing2 / Sing2 均可）："
+    echo "------------------------------------------"
+    echo "sing2              - 显示管理菜单"
+    echo "sing2 start        - 启动"
+    echo "sing2 stop         - 停止"
+    echo "sing2 restart      - 重启"
+    echo "sing2 status       - 查看状态"
+    echo "sing2 enable       - 设置开机自启"
+    echo "sing2 disable      - 取消开机自启"
+    echo "sing2 log          - 查看日志"
+    echo "sing2 config       - 编辑配置文件"
+    echo "sing2 generate     - 生成配置文件（向导）"
+    echo "sing2 x25519       - 生成 REALITY 密钥对"
+    echo "sing2 update       - 更新到最新版"
+    echo "sing2 update x.x.x - 更新到指定版本"
+    echo "sing2 install      - 安装"
+    echo "sing2 uninstall    - 卸载"
+    echo "sing2 version      - 查看版本"
+    echo "------------------------------------------"
+}
+
+show_menu() {
+    echo -e "
+  ${green}Sing2 后端管理脚本${plain}
+--- https://github.com/${REPO} ---
+  ${green}0.${plain} 修改配置
+————————————————
+  ${green}1.${plain} 安装 Sing2
+  ${green}2.${plain} 更新 Sing2
+  ${green}3.${plain} 卸载 Sing2
+————————————————
+  ${green}4.${plain} 启动 Sing2
+  ${green}5.${plain} 停止 Sing2
+  ${green}6.${plain} 重启 Sing2
+  ${green}7.${plain} 查看 Sing2 状态
+  ${green}8.${plain} 查看 Sing2 日志
+————————————————
+  ${green}9.${plain} 设置 Sing2 开机自启
+ ${green}10.${plain} 取消 Sing2 开机自启
+————————————————
+ ${green}11.${plain} 一键安装 bbr (最新内核)
+ ${green}12.${plain} 查看 Sing2 版本
+ ${green}13.${plain} 升级 Sing2 维护脚本
+ ${green}14.${plain} 生成 Sing2 配置文件
+ ${green}15.${plain} 放行 VPS 的所有网络端口
+ ${green}16.${plain} 生成 REALITY 密钥对
+ "
+    show_status
+    echo && read -rp "请输入选择 [0-16]: " num
+
+    case "${num}" in
+        0) config ;;
+        1) check_uninstall && install ;;
+        2) check_install && update ;;
+        3) check_install && uninstall ;;
+        4) check_install && start ;;
+        5) check_install && stop ;;
+        6) check_install && restart ;;
+        7) check_install && status ;;
+        8) check_install && show_log ;;
+        9) check_install && enable ;;
+        10) check_install && disable ;;
+        11) install_bbr ;;
+        12) check_install && show_Sing2_version ;;
+        13) update_shell ;;
+        14) generate_config_file ;;
+        15) open_ports ;;
+        16) check_install && gen_x25519 ;;
+        *) echo -e "${red}请输入正确的数字 [0-16]${plain}" ;;
+    esac
+}
+
+if [[ $# -gt 0 ]]; then
+    case $1 in
+        "start")     check_install 0 && start 0 ;;
+        "stop")      check_install 0 && stop 0 ;;
+        "restart")   check_install 0 && restart 0 ;;
+        "status")    check_install 0 && status 0 ;;
+        "enable")    check_install 0 && enable 0 ;;
+        "disable")   check_install 0 && disable 0 ;;
+        "log")       check_install 0 && show_log 0 ;;
+        "update")    check_install 0 && update 0 "$2" ;;
+        "config")    config "$@" ;;
+        "generate")  generate_config_file 0 ;;
+        "x25519")    gen_x25519 0 ;;
+        "install")   check_uninstall 0 && install 0 ;;
+        "uninstall") check_install 0 && uninstall 0 ;;
+        "version")   check_install 0 && show_Sing2_version 0 ;;
+        "update_shell") update_shell ;;
+        *) show_usage ;;
+    esac
+else
+    show_menu
+fi

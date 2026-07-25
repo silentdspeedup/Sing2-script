@@ -1,0 +1,144 @@
+# Sing2 配置示例
+# SPDX-License-Identifier: GPL-3.0-or-later
+#
+# 字段规范见 doc/09-config-and-migration.md。本文件只包含**已实现**的配置项——
+# doc/09 里规范了但尚未实现的三个顶层块（ConnectionConfig / DnsConfig /
+# RouteConfig）刻意没有出现在这里，写进去会被静默忽略（doc/09 §3 实现状态）。
+#
+# 与 XrayR config.yml 的差异：
+#   - 删除 DnsConfigPath / InboundConfigPath / OutboundConfigPath /
+#     RouteConfigPath（xray json 路径，Sing2 无对应概念）
+#   - PanelType 只支持 SSpanel（mod_mu 系，含传统 SSpanel 与 Phoenix 两代）
+#   - 新增 AccessLog（访问日志上报）、ConnLimitConfig（并发连接数上限）
+
+Log:
+  Level: warning # none / error / warning / info / debug
+  AccessPath: # /etc/Sing2/access.log
+  ErrorPath: # /etc/Sing2/error.log
+
+# 访问日志上报（进程级，可选）。面板需实现 POST /mod_mu/users/accesslog。
+AccessLog:
+  Enable: false
+  ReportInvalidUser: true # 无用户的探测行是否上报
+  ProbeReportPolicy: broadcast # broadcast / first / none
+  BatchSize: 500 # 攒够多少条即 flush
+  FlushInterval: 3s # 至少多久 flush 一次
+  MaxBatch: 1000 # 单次 POST 上限，须 ≤ 面板侧单批入库上限
+  BufferMax: 50000 # 每节点内存缓冲上限，满时丢最旧
+  IngestChanSize: 100000 # 热路径投递通道容量，满即丢弃、绝不阻塞转发
+
+Nodes:
+  # ——— 节点 1：V2ray（VMess / VLESS，传统 SSpanel 或 Phoenix 均可）———
+  - PanelType: SSpanel # 唯一合法取值
+    ApiConfig:
+      ApiHost: http://panel.example.com
+      ApiKey: your-mu-key
+      NodeID: 1
+      NodeType: V2ray # V2ray / Vmess / Vless / Trojan / Shadowsocks / Mieru …
+      Timeout: 30
+      # VMess 还是 VLESS：面板 server 串里的 enable_vless 优先，这里只是兜底。
+      # 同一份配置因此能同时服务 VMess-TCP / VMess-WS-TLS / VLESS-Vision-REALITY
+      # 三种节点（doc/13 T2）。
+      EnableVless: false
+      VlessFlow: xtls-rprx-vision # 置此值时 TLS 或 REALITY 必须开启
+      SpeedLimit: 0 # Mbps，本地设置会覆盖面板下发，0 = 不限
+      DeviceLimit: 0 # 本地设置会覆盖面板下发，0 = 不限
+      RuleListPath: # /etc/Sing2/rulelist
+      DisableCustomConfig: false # true 则强制走旧版 server 串解析
+
+    ControllerConfig:
+      ListenIP: 0.0.0.0
+      SendIP: 0.0.0.0
+      UpdatePeriodic: 60 # 面板同步周期（秒）
+      EnableDNS: false
+      DNSType: AsIs # AsIs / UseIP / UseIPv4 / UseIPv6
+      EnableProxyProtocol: false
+      EnableFallback: false
+
+      # 节点本地 REALITY。私钥只能放在这里——面板的 server 串同时用于渲染用户
+      # 订阅，写进去等于发给每个客户端（doc/13 T3）。
+      # 合并语义：私钥 / Dest 取本地；ServerNames / ShortIds 优先取面板下发，
+      # 因此一份 REALITYConfigs 可服务多个 REALITY 节点。
+      EnableREALITY: false
+      DisableLocalREALITYConfig: false
+      REALITYConfigs:
+        Show: false
+        Dest: www.microsoft.com:443
+        ProxyProtocolVer: 0
+        ServerNames:
+          - www.microsoft.com
+        PrivateKey: # x25519 私钥，用 `sing2 x25519` 或 xray x25519 生成
+        MinClientVer:
+        MaxClientVer:
+        MaxTimeDiff: 0
+        ShortIds:
+          - ""
+
+      # 动态限速：周期流量超 Limit 且累计 WarnTimes 次后降速到 LimitSpeed，
+      # 持续 LimitDuration 分钟后释放。Limit=0 关闭。
+      AutoSpeedLimitConfig:
+        Limit: 0 # Mbps
+        WarnTimes: 0
+        LimitSpeed: 0 # Mbps
+        LimitDuration: 0 # 分钟
+
+      # 跨节点在线设备数限制（需要 Redis）
+      GlobalDeviceLimitConfig:
+        Enable: false
+        RedisNetwork: tcp
+        RedisAddr: 127.0.0.1:6379
+        RedisUsername:
+        RedisPassword:
+        RedisDB: 0
+        Timeout: 5
+        Expiry: 60
+
+      # 每用户并发连接数上限（Sing2 净新增，XrayR 无此能力）
+      ConnLimitConfig:
+        Enable: false
+        MaxConnPerUser: 0
+
+      CertConfig:
+        CertMode: none # none / file / http / dns / tls
+        CertDomain: node1.example.com
+        CertFile: /etc/Sing2/cert/node1.example.com.crt
+        KeyFile: /etc/Sing2/cert/node1.example.com.key
+        Provider: cloudflare # CertMode=dns 时的 DNS provider
+        Email: admin@example.com
+        DNSEnv:
+          CLOUDFLARE_DNS_API_TOKEN: your-token
+
+# ——— 更多节点示例（按需取消注释）———
+#
+#  # Trojan（强制 TLS）
+#  - PanelType: SSpanel
+#    ApiConfig:
+#      ApiHost: http://panel.example.com
+#      ApiKey: your-mu-key
+#      NodeID: 2
+#      NodeType: Trojan
+#      Timeout: 30
+#    ControllerConfig:
+#      ListenIP: 0.0.0.0
+#      UpdatePeriodic: 60
+#      CertConfig:
+#        CertMode: dns
+#        CertDomain: node2.example.com
+#        Provider: cloudflare
+#        Email: admin@example.com
+#        DNSEnv:
+#          CLOUDFLARE_DNS_API_TOKEN: your-token
+#
+#  # Mieru（自带加密，无 TLS；用户名为 u{uid}，须与面板订阅一致）
+#  - PanelType: SSpanel
+#    ApiConfig:
+#      ApiHost: http://panel.example.com
+#      ApiKey: your-mu-key
+#      NodeID: 3
+#      NodeType: Mieru
+#      Timeout: 30
+#    ControllerConfig:
+#      ListenIP: 0.0.0.0
+#      UpdatePeriodic: 60
+#      CertConfig:
+#        CertMode: none

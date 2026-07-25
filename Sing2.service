@@ -1,0 +1,22 @@
+[Unit]
+Description=Sing2 Service
+Documentation=https://github.com/silentdspeedup/Sing2
+After=network.target nss-lookup.target
+Wants=network.target
+
+[Service]
+User=root
+Group=root
+Type=simple
+LimitAS=infinity
+LimitRSS=infinity
+LimitCORE=infinity
+# 代理节点的连接数就是文件描述符数，默认 1024 会在几百用户时静默耗尽。
+LimitNOFILE=999999
+WorkingDirectory=/usr/local/Sing2/
+ExecStart=/usr/local/Sing2/sing2 serve --config /etc/Sing2/config.yml
+Restart=on-failure
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target
