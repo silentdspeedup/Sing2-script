@@ -82,11 +82,27 @@ sing2 version      查看版本
 |---|---|---|
 | 代理核 | xray-core | sing-box fork（shtorm-7/sing-box-extended） |
 | 配置路径 | `/etc/XrayR/config.yml` | `/etc/Sing2/config.yml` |
-| 附属配置 | `dns.json` / `route.json` / `custom_*.json` | 无（对应能力走 sing-box 原生或尚未实现） |
-| geoip/geosite | 随发行包下载 | 不随包（路由翻译尚未实现） |
-| 面板 | SSpanel / V2board / PMpanel / Proxypanel | 仅 SSpanel（mod_mu 系） |
+| 面板 | SSpanel / V2board / PMpanel / Proxypanel | 仅 SSpanel（mod_mu 系，两代都支持） |
 | 并发连接数上限 | 无 | 有（`ConnLimitConfig`） |
 | 访问日志上报 | 定制版有 | 有（`AccessLog`） |
+| 用户增删 | 动态 | 动态，且**已建立连接不中断**（全 9 协议） |
+
+### ⚠ XrayR 的附属配置文件，Sing2 目前的对应情况
+
+Sing2 不使用这些**文件**（它们是 xray 格式），但要注意其中几项对应的**能力目前也没有**：
+
+| XrayR 文件 | 用途 | Sing2 现状 |
+|---|---|---|
+| `dns.json` | 自定义 DNS 上游与分流 | ❌ **不可用**。翻译代码在，但没有任何数据源填充它——`config.yml` 里的 `EnableDNS` / `DNSType` 置任何值都不生效 |
+| `route.json` | 路由/分流规则 | ❌ **完全未实现**。没有 `option.Route` 翻译代码 |
+| `geoip.dat` / `geosite.dat` | 供 route.json 做地理分流 | ➖ 无意义（路由未实现，故不随包分发） |
+| `custom_outbound.json` | 自定义出站（分流到 WARP、落地机中转、SOCKS 上游等） | ❌ **未实现**。当前只有一个 `direct` 出站，所有流量直出 |
+| `custom_inbound.json` | 额外入站 | ➖ 不适用（入站全部由面板下发） |
+| `rulelist` | 本地审计正则 | ✅ 支持（`ApiConfig.RuleListPath`） |
+
+**这意味着**：如果你的节点依赖「广告拦截 / 地理分流 / 特定域名走 WARP / 中转落地」这类
+能力，Sing2 现阶段做不到——它目前是一个"纯直出"的计费节点。纯直出场景（绝大多数
+机场落地节点）不受影响。
 
 ## 许可证
 
