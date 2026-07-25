@@ -1,13 +1,13 @@
 # Sing2 配置示例
 # SPDX-License-Identifier: GPL-3.0-or-later
 #
-# 字段规范见 doc/09-config-and-migration.md。本文件只包含**已实现**的配置项——
-# doc/09 里规范了但尚未实现的三个顶层块（ConnectionConfig / DnsConfig /
-# RouteConfig）刻意没有出现在这里，写进去会被静默忽略（doc/09 §3 实现状态）。
+# 字段规范见 doc/09-config-and-migration.md。本文件只包含**已实现**的配置项
+# （`ConnectionConfig` 仍未实现，故刻意不出现——写进去会被静默忽略）。
 #
 # 与 XrayR config.yml 的差异：
 #   - 删除 DnsConfigPath / InboundConfigPath / OutboundConfigPath /
-#     RouteConfigPath（xray json 路径，Sing2 无对应概念）
+#     RouteConfigPath 这些「指向 xray json 文件」的路径项；对应能力改为**直接内联**
+#     写在本文件里（DnsConfig / OutboundConfig / RouteConfig，见文件末尾）
 #   - PanelType 只支持 SSpanel（mod_mu 系，含传统 SSpanel 与 Phoenix 两代）
 #   - 新增 AccessLog（访问日志上报）、ConnLimitConfig（并发连接数上限）
 
@@ -142,3 +142,86 @@ Nodes:
 #      UpdatePeriodic: 60
 #      CertConfig:
 #        CertMode: none
+
+# ============================================================================
+# 以下三块是 **sing-box 原生配置的直接透传**（doc/09 §6）
+# ============================================================================
+#
+# 它们不做字段翻译：你写什么，sing-box 就收到什么。键名与 sing-box 官方 JSON 文档
+# **完全一致**（snake_case），只是用 YAML 语法书写。
+#
+# ⚠ 两条必须知道的：
+#   1. **未知键会导致整块被拒**，节点起不来。改动前对照你所用基座版本的
+#      sing-box 文档核对键名。
+#   2. 三块**全部可省略**。省略时：DNS 用 box 默认、出站只有一个 direct、
+#      不做任何分流（全部直出）——这就是 v0.0.1 的默认行为。
+
+# ---------------------------------------------------------------------------
+# 自定义 DNS（对应 XrayR 的 dns.json）
+# ---------------------------------------------------------------------------
+# DnsConfig:
+#   servers:
+#     - tag: google
+#       type: tls
+#       server: 8.8.8.8
+#     - tag: local
+#       type: udp
+#       server: 223.5.5.5
+#   rules:
+#     - domain_suffix: [".cn"]
+#       server: local
+#   strategy: prefer_ipv4   # prefer_ipv4 / prefer_ipv6 / ipv4_only / ipv6_only
+#   disable_cache: false
+
+# ---------------------------------------------------------------------------
+# 自定义出站（对应 XrayR 的 custom_outbound.json）
+# ---------------------------------------------------------------------------
+# 省略时等价于只有一个 direct。若你定义了本块但没写 direct，Sing2 会自动在**末尾**
+# 追加一个 tag=direct 的出站（追加在末尾不会改变默认出站，只是保证路由规则永远
+# 有个 direct 可用）。每个出站**必须有 tag**——路由规则靠 tag 寻址。
+#
+# OutboundConfig:
+#   - type: direct
+#     tag: direct
+#   # 落地机中转 / 解锁出口
+#   - type: socks
+#     tag: relay
+#     server: 10.0.0.2
+#     server_port: 1080
+#   # 黑洞：配合 route 的 reject 或直接指向它来丢弃流量
+#   - type: block
+#     tag: blackhole
+
+# ---------------------------------------------------------------------------
+# 分流规则（对应 XrayR 的 route.json）
+# ---------------------------------------------------------------------------
+# RouteConfig:
+#   rules:
+#     # 广告拦截（fail closed：命中即断，不会漏过）
+#     - domain_suffix: [".doubleclick.net", ".googlesyndication.com"]
+#       action: reject
+#     # 指定域名走中转出口
+#     - domain_suffix: [".netflix.com", ".nflxvideo.net"]
+#       outbound: relay
+#     # 按 rule-set 分流（见下方 geo 数据说明）
+#     - rule_set: ["geosite-cn"]
+#       outbound: direct
+#   rule_set:
+#     - tag: geosite-cn
+#       type: remote
+#       format: binary
+#       url: "https://raw.githubusercontent.com/SagerNet/sing-geosite/rule-set/geosite-cn.srs"
+#       download_detour: direct
+#   final: direct   # 未命中任何规则时的默认出站
+#
+# 【geoip / geosite 数据】
+# Sing2 的发行包**不含** geoip.dat / geosite.dat——sing-box 用的是自己的 .srs
+# rule-set 格式，与 xray 的 .dat 不通用。两种取法：
+#   - remote（如上例）：首次启动时自动下载并缓存，需节点能访问该 URL；
+#     download_detour 指定用哪个出站去下载。
+#   - local：先把 .srs 下载到节点上，然后
+#       - tag: geosite-cn
+#         type: local
+#         format: binary
+#         path: /etc/Sing2/geosite-cn.srs
+# 规则集索引：https://github.com/SagerNet/sing-geosite ／ sing-geoip

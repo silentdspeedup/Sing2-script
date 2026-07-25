@@ -73,8 +73,8 @@ sing2 version      查看版本
 - **Mieru / TrustTunnel 的用户名是 `u{uid}`。** 这是节点端与面板之间的硬约定，面板订阅
   渲染的 `username` 必须一致，否则这两个协议会鉴权失败（而且表现是"客户端连不上"，
   两侧都不报错）。
-- `doc/09` 里规范了但**尚未实现**的三个顶层块 `ConnectionConfig` / `DnsConfig` /
-  `RouteConfig`，写进配置会被静默忽略。
+- **自定义 DNS / 出站 / 分流**用顶层 `DnsConfig` / `OutboundConfig` / `RouteConfig`
+  三块（见下节）。唯一仍未实现的是 `ConnectionConfig`。
 
 ## 与 XrayR 的差异
 
@@ -87,22 +87,31 @@ sing2 version      查看版本
 | 访问日志上报 | 定制版有 | 有（`AccessLog`） |
 | 用户增删 | 动态 | 动态，且**已建立连接不中断**（全 9 协议） |
 
-### ⚠ XrayR 的附属配置文件，Sing2 目前的对应情况
+### XrayR 的附属配置文件，Sing2 的对应方式
 
-Sing2 不使用这些**文件**（它们是 xray 格式），但要注意其中几项对应的**能力目前也没有**：
+Sing2 不使用这些**文件**（它们是 xray 格式），对应能力改为**直接内联写在 config.yml 里**：
 
-| XrayR 文件 | 用途 | Sing2 现状 |
+| XrayR 文件 | Sing2 对应 | 说明 |
 |---|---|---|
-| `dns.json` | 自定义 DNS 上游与分流 | ❌ **不可用**。翻译代码在，但没有任何数据源填充它——`config.yml` 里的 `EnableDNS` / `DNSType` 置任何值都不生效 |
-| `route.json` | 路由/分流规则 | ❌ **完全未实现**。没有 `option.Route` 翻译代码 |
-| `geoip.dat` / `geosite.dat` | 供 route.json 做地理分流 | ➖ 无意义（路由未实现，故不随包分发） |
-| `custom_outbound.json` | 自定义出站（分流到 WARP、落地机中转、SOCKS 上游等） | ❌ **未实现**。当前只有一个 `direct` 出站，所有流量直出 |
-| `custom_inbound.json` | 额外入站 | ➖ 不适用（入站全部由面板下发） |
-| `rulelist` | 本地审计正则 | ✅ 支持（`ApiConfig.RuleListPath`） |
+| `dns.json` | `DnsConfig:` | sing-box `dns{}` 直接透传 |
+| `route.json` | `RouteConfig:` | sing-box `route{}` 直接透传 |
+| `custom_outbound.json` | `OutboundConfig:` | sing-box outbound 数组直接透传 |
+| `custom_inbound.json` | ➖ 不适用 | 入站全部由面板下发 |
+| `geoip.dat` / `geosite.dat` | `RouteConfig.rule_set` | sing-box 用自己的 `.srs` 格式，与 xray 的 `.dat` **不通用**；remote 自动下载或 local 指向本地文件 |
+| `rulelist` | `ApiConfig.RuleListPath` | 本地审计正则，沿用 |
 
-**这意味着**：如果你的节点依赖「广告拦截 / 地理分流 / 特定域名走 WARP / 中转落地」这类
-能力，Sing2 现阶段做不到——它目前是一个"纯直出"的计费节点。纯直出场景（绝大多数
-机场落地节点）不受影响。
+三块**都可省略**——省略时 DNS 用默认、只有一个 `direct` 出站、不分流（全部直出）。
+完整可用示例见 [`config/config.yml`](config/config.yml) 末尾。
+
+⚠ 两个必须知道的：
+
+1. **未知键会导致整块被拒、节点起不来**。这三块是原生透传，键名要对照你所用
+   sing-box 版本的官方文档；错误信息会点名是哪一块。
+2. `ControllerConfig` 里的 `EnableDNS` / `DNSType` **仍然无效**（它们走的是"面板下发
+   DNS"那条路径，目前没有数据源）。要自定义 DNS 请用顶层 `DnsConfig`。
+
+还未实现的只剩 `ConnectionConfig`（`Handshake`/`ConnIdle`/`BufferSize` 等连接调优），
+写进配置会被静默忽略。
 
 ## 许可证
 
