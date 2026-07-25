@@ -78,7 +78,12 @@ sing2 version      查看版本
   渲染的 `username` 必须一致，否则这两个协议会鉴权失败（而且表现是"客户端连不上"，
   两侧都不报错）。
 - **自定义 DNS / 出站 / 分流**用顶层 `DnsConfig` / `OutboundConfig` / `RouteConfig`
-  三块（见下节）。唯一仍未实现的是 `ConnectionConfig`。
+  三块（见下节）。
+- **连接调优**用顶层 `ConnectionConfig`（`UDPTimeout` / `TCPKeepAlive` /
+  `TCPKeepAliveInterval` / `DisableTCPKeepAlive`，单位整数秒）。注意它**不是**
+  XrayR 那五个字段的移植：`Handshake` / `ConnIdle` / `UplinkOnly` / `DownlinkOnly` /
+  `BufferSize` 是 xray policy 的设置，sing-box 没有 policy 这一层，写进去不生效，
+  但启动时会逐条告警说明替代方案，不会静默吞掉。
 
 ## 与 XrayR 的差异
 
@@ -113,9 +118,11 @@ Sing2 不使用这些**文件**（它们是 xray 格式），对应能力改为*
    sing-box 版本的官方文档；错误信息会点名是哪一块。
 2. `ControllerConfig` 里的 `EnableDNS` / `DNSType` **仍然无效**（它们走的是"面板下发
    DNS"那条路径，目前没有数据源）。要自定义 DNS 请用顶层 `DnsConfig`。
+3. `ConnectionConfig` 里 XrayR 的 `ConnIdle` **不要直接搬数值到 `UDPTimeout`**：
+   xray 的 connIdle 默认 30 秒且同时管 TCP，而 sing-box 的 `udp_timeout` 默认约
+   300 秒，照搬会让 UDP 会话在 30 秒被切断。
 
-还未实现的只剩 `ConnectionConfig`（`Handshake`/`ConnIdle`/`BufferSize` 等连接调优），
-写进配置会被静默忽略。
+配置面到此已完整——顶层不再有被静默忽略的键。
 
 ## 许可证
 
