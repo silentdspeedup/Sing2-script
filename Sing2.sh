@@ -77,23 +77,27 @@ install() {
 }
 
 update() {
-    local version
+    # 空参数一律丢掉：install.sh 会把空串当成版本号拼进下载地址
+    # （.../download//Sing2-*.zip → 404）。"用最新版"的正确表达是不传参数。
+    local -a passthru=()
     if [[ $# == 0 ]]; then
-        echo && echo -n -e "输入指定版本(默认最新版): " && read -r version
+        local version
+        echo && echo -n -e "输入指定版本(默认最新版，加 -f 强制重装): " && read -r version
+        for a in ${version}; do passthru+=("$a"); done
     else
-        version=$2
+        shift   # 去掉菜单标记位
+        local a
+        for a in "$@"; do [[ -n "$a" ]] && passthru+=("$a"); done
     fi
-    # 空版本号不能往下传：install.sh 会把它拼进下载地址（.../download//Sing2-*.zip）。
-    # "用最新版"的正确表达是**不传参数**，不是传一个空串。
-    if [[ -n "$version" ]]; then
-        bash <(curl -Ls "https://raw.githubusercontent.com/${SCRIPT_REPO}/master/install.sh") "$version"
-    else
-        bash <(curl -Ls "https://raw.githubusercontent.com/${SCRIPT_REPO}/master/install.sh")
-    fi
-    if [[ $? == 0 ]]; then
-        echo -e "${green}更新完成，已自动重启 Sing2，请用 sing2 log 查看运行日志${plain}"
-        exit
-    fi
+
+    bash <(curl -Ls "https://raw.githubusercontent.com/${SCRIPT_REPO}/master/install.sh") "${passthru[@]}"
+    local rc=$?
+    case $rc in
+        0)  echo -e "${green}更新完成，已自动重启 Sing2，请用 sing2 log 查看运行日志${plain}"
+            exit ;;
+        10) ;;  # 已是最新，install.sh 自己说过了，别再报"更新完成"
+        *)  ;;  # 失败，install.sh 已经打印过原因
+    esac
     [[ $# == 0 ]] && before_show_menu
 }
 
@@ -603,6 +607,7 @@ show_usage() {
     echo "sing2 x25519       - 生成 REALITY 密钥对"
     echo "sing2 update       - 更新到最新版"
     echo "sing2 update x.x.x - 更新到指定版本"
+    echo "sing2 update -f    - 强制重装当前版本"
     echo "sing2 install      - 安装"
     echo "sing2 uninstall    - 卸载"
     echo "sing2 version      - 查看版本"
@@ -669,7 +674,7 @@ if [[ $# -gt 0 ]]; then
         "enable")    check_install 0 && enable 0 ;;
         "disable")   check_install 0 && disable 0 ;;
         "log")       check_install 0 && show_log 0 ;;
-        "update")    check_install 0 && update 0 "$2" ;;
+        "update")    check_install 0 && update 0 "${@:2}" ;;
         "config")    config "$@" ;;
         "generate")  generate_config_file 0 ;;
         "x25519")    gen_x25519 0 ;;

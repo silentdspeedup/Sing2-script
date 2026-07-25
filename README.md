@@ -15,11 +15,14 @@ SSpanel（mod_mu 系，传统版与 custom_config 版都支持），协议由 si
 bash <(curl -Ls https://raw.githubusercontent.com/silentdspeedup/Sing2-script/master/install.sh)
 ```
 
-安装指定版本：
+安装指定版本（`v` 前缀可省）：
 
 ```bash
 bash <(curl -Ls https://raw.githubusercontent.com/silentdspeedup/Sing2-script/master/install.sh) v1.0.0
 ```
+
+已装同一版本时安装脚本会直接报"无需更新"并退出（退出码 10），只刷新管理脚本，
+不动二进制和配置。要强制重装加 `--force`。
 
 ## 使用
 
@@ -37,8 +40,9 @@ sing2 log          查看日志（journalctl -f）
 sing2 config       编辑配置文件
 sing2 generate     生成配置文件（向导）
 sing2 x25519       生成 REALITY 密钥对
-sing2 update       更新到最新版
+sing2 update       更新到最新版（已是最新则提示"无需更新"，不重装）
 sing2 update x.x.x 更新到指定版本
+sing2 update -f    强制重装当前版本（修复被改坏的安装）
 sing2 install      安装
 sing2 uninstall    卸载
 sing2 version      查看版本

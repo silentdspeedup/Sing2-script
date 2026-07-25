@@ -224,6 +224,28 @@ check_status() {
     [[ x"${temp}" == x"active" ]] && return 0 || return 1
 }
 
+# 管理脚本与 Sing2 本体的发版节奏不同（脚本改一行不值得给本体打 tag），
+# 所以"本体已是最新"时也要刷新它，否则脚本层的修复就永远推不下去。
+install_manager() {
+    if fetch "https://raw.githubusercontent.com/${SCRIPT_REPO}/master/Sing2.sh" /usr/bin/sing2; then
+        chmod +x /usr/bin/sing2
+        ln -sf /usr/bin/sing2 /usr/bin/Sing2   # 大小写兼容
+    else
+        echo -e "${yellow}管理脚本下载失败，可稍后手动获取；不影响 Sing2 本体运行${plain}"
+    fi
+}
+
+# 已安装版本。以二进制自报为准而不是记在某个文件里——文件会和实际装的东西脱节。
+# `sing2 version` 打印 "sing2 v0.0.2"；本地 make build 出来的是 "dev"，
+# 那种情况当作未知，照常重装。
+installed_version() {
+    [[ -x "${INSTALL_DIR}/sing2" ]] || return 1
+    local v
+    v=$("${INSTALL_DIR}/sing2" version 2>/dev/null | awk '{print $2}')
+    [[ -n "$v" && "$v" != "dev" ]] || return 1
+    echo "$v"
+}
+
 install_Sing2() {
     local last_version url
     # 空串必须当成"没指定版本"。`sing2 update` 直接回车会把一个空参数一路传到这里，
@@ -249,6 +271,17 @@ install_Sing2() {
         echo -e "${red}版本号为空，拒绝拼接下载地址${plain}"
         exit 1
     fi
+    # 同版本不重装。退出码 10 是给 Sing2.sh 的信号，让它别报"更新完成"。
+    local current
+    current=$(installed_version) || current=""
+    if [[ -n "$current" && "$current" == "$last_version" && "${FORCE}" != "1" ]]; then
+        echo -e "${green}当前已是 ${last_version}，无需更新${plain}"
+        install_manager
+        echo -e "如需强制重装本体：${yellow}bash install.sh ${last_version} --force${plain}"
+        exit 10
+    fi
+    [[ -n "$current" ]] && echo -e "当前版本：${yellow}${current}${plain} → ${green}${last_version}${plain}"
+
     url="https://github.com/${REPO}/releases/download/${last_version}/Sing2-${arch}.zip"
 
     # 下载到临时目录再落盘：直接删 INSTALL_DIR 会在下载失败时把一个能跑的节点
@@ -284,13 +317,7 @@ install_Sing2() {
     systemctl enable Sing2 >/dev/null 2>&1
     echo -e "${green}Sing2 ${last_version}${plain} 安装完成，已设置开机自启"
 
-    # 管理脚本
-    if fetch "https://raw.githubusercontent.com/${SCRIPT_REPO}/master/Sing2.sh" /usr/bin/sing2; then
-        chmod +x /usr/bin/sing2
-        ln -sf /usr/bin/sing2 /usr/bin/Sing2   # 大小写兼容
-    else
-        echo -e "${yellow}管理脚本下载失败，可稍后手动获取；不影响 Sing2 本体运行${plain}"
-    fi
+    install_manager
 
     # 配置：全新安装才铺示例，升级绝不覆盖
     if [[ ! -f "${CONF_DIR}/config.yml" ]]; then
@@ -331,12 +358,24 @@ install_Sing2() {
     echo "sing2 x25519       - 生成 REALITY 密钥对"
     echo "sing2 update       - 更新到最新版"
     echo "sing2 update x.x.x - 更新到指定版本"
+    echo "sing2 update -f    - 强制重装当前版本"
     echo "sing2 install      - 安装"
     echo "sing2 uninstall    - 卸载"
     echo "sing2 version      - 查看版本"
     echo "------------------------------------------"
 }
 
+# --force/-f 从版本号里摘出来，剩下的才是版本号。
+FORCE=0
+declare -a install_args=()
+for a in "$@"; do
+    case "$a" in
+        -f|--force) FORCE=1 ;;
+        "")         ;;   # 空参数忽略：`sing2 update` 回车曾把空串一路传下来
+        *)          install_args+=("$a") ;;
+    esac
+done
+
 echo -e "${green}开始安装 Sing2${plain}"
 install_base
-install_Sing2 "$@"
+install_Sing2 "${install_args[@]}"
