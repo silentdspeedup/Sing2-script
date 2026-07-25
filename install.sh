@@ -226,7 +226,9 @@ check_status() {
 
 install_Sing2() {
     local last_version url
-    if [[ $# -eq 0 ]]; then
+    # 空串必须当成"没指定版本"。`sing2 update` 直接回车会把一个空参数一路传到这里，
+    # 而老逻辑只看 $#，于是拼出 .../download//Sing2-linux-64.zip 然后 404。
+    if [[ $# -eq 0 || -z "$1" ]]; then
         last_version=$(curl -Ls "https://api.github.com/repos/${REPO}/releases/latest" |
             grep '"tag_name":' | sed -E 's/.*"([^"]+)".*/\1/')
         if [[ -z "$last_version" ]]; then
@@ -237,7 +239,15 @@ install_Sing2() {
         echo -e "检测到最新版本：${green}${last_version}${plain}，开始安装"
     else
         last_version=$1
+        # release tag 一律带 v 前缀，允许用户少打这个 v（0.0.2 → v0.0.2）。
+        [[ "$last_version" =~ ^[0-9] ]] && last_version="v${last_version}"
         echo -e "开始安装 Sing2 ${green}${last_version}${plain}"
+    fi
+
+    # 兜底：宁可在这里停，也不要把空版本号拼进 URL 再去问 GitHub 要 404。
+    if [[ -z "$last_version" ]]; then
+        echo -e "${red}版本号为空，拒绝拼接下载地址${plain}"
+        exit 1
     fi
     url="https://github.com/${REPO}/releases/download/${last_version}/Sing2-${arch}.zip"
 

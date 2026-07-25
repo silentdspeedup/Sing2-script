@@ -77,12 +77,19 @@ install() {
 }
 
 update() {
+    local version
     if [[ $# == 0 ]]; then
         echo && echo -n -e "输入指定版本(默认最新版): " && read -r version
     else
         version=$2
     fi
-    bash <(curl -Ls "https://raw.githubusercontent.com/${SCRIPT_REPO}/master/install.sh") "$version"
+    # 空版本号不能往下传：install.sh 会把它拼进下载地址（.../download//Sing2-*.zip）。
+    # "用最新版"的正确表达是**不传参数**，不是传一个空串。
+    if [[ -n "$version" ]]; then
+        bash <(curl -Ls "https://raw.githubusercontent.com/${SCRIPT_REPO}/master/install.sh") "$version"
+    else
+        bash <(curl -Ls "https://raw.githubusercontent.com/${SCRIPT_REPO}/master/install.sh")
+    fi
     if [[ $? == 0 ]]; then
         echo -e "${green}更新完成，已自动重启 Sing2，请用 sing2 log 查看运行日志${plain}"
         exit
