@@ -83,6 +83,31 @@ if [[ -z "$arch" ]]; then
 fi
 echo -e "架构：${green}${arch}${plain}"
 
+# fetch URL → 本地文件。
+#
+# 两个刻意的选择：
+#   - 不用 `wget --show-progress`：该选项 wget 1.16 才有，CentOS 7 自带 1.14，
+#     会直接 "unrecognized option" 退出。
+#   - 一律先下到临时文件再搬运：`wget -O /path` 会在**开始下载前**就把目标文件
+#     创建/清空，失败时留下一个 0 字节文件。对 /etc/systemd/system/Sing2.service
+#     来说，这个空文件会让后续 `[ -f ]` 判断误以为"已安装"，而 systemd 说
+#     "Unit not found" —— 正是最难排查的那种状态。
+fetch() {
+    local url=$1 dest=$2 tmpf
+    tmpf=$(mktemp) || return 1
+    if command -v curl >/dev/null 2>&1; then
+        curl -fsSL --retry 3 --connect-timeout 15 -o "$tmpf" "$url" || { rm -f "$tmpf"; return 1; }
+    elif command -v wget >/dev/null 2>&1; then
+        wget -q --no-check-certificate -O "$tmpf" "$url" || { rm -f "$tmpf"; return 1; }
+    else
+        echo -e "${red}系统既没有 curl 也没有 wget${plain}"
+        return 1
+    fi
+    [[ -s "$tmpf" ]] || { rm -f "$tmpf"; return 1; }   # 空文件视为失败
+    mv -f "$tmpf" "$dest" || { rm -f "$tmpf"; return 1; }
+    return 0
+}
+
 install_base() {
     if [[ x"${release}" == x"centos" ]]; then
         yum install epel-release -y
@@ -125,7 +150,7 @@ install_Sing2() {
     trap 'rm -rf "$tmp"' EXIT
 
     echo -e "下载：${url}"
-    if ! wget -q --show-progress --no-check-certificate -O "${tmp}/Sing2.zip" "${url}"; then
+    if ! fetch "${url}" "${tmp}/Sing2.zip"; then
         echo -e "${red}下载失败${plain}——请确认该版本存在，且服务器能访问 GitHub"
         exit 1
     fi
@@ -149,19 +174,31 @@ install_Sing2() {
     # systemd unit：优先用压缩包里的（离线可用），拿不到再回落到脚本仓库
     if [[ -f "${tmp}/unpacked/Sing2.service" ]]; then
         install -m 644 "${tmp}/unpacked/Sing2.service" /etc/systemd/system/Sing2.service
-    else
-        wget -q --no-check-certificate -O /etc/systemd/system/Sing2.service \
-            "https://raw.githubusercontent.com/${SCRIPT_REPO}/master/Sing2.service" ||
-            { echo -e "${red}获取 Sing2.service 失败${plain}"; exit 1; }
+    elif ! fetch "https://raw.githubusercontent.com/${SCRIPT_REPO}/master/Sing2.service" \
+        /etc/systemd/system/Sing2.service; then
+        echo -e "${red}获取 Sing2.service 失败${plain}"
+        exit 1
     fi
+    chmod 644 /etc/systemd/system/Sing2.service
 
     systemctl daemon-reload
+
+    # 校验 systemd 确实登记了这个 unit。不验的话，一个写坏/写空的 unit 文件会让
+    # 后续所有「文件在不在」式的判断都误报"已安装"，而 systemctl 一直说 not found
+    # —— 正是最难排查的那种状态。
+    if ! systemctl list-unit-files 2>/dev/null | grep -q '^Sing2\.service'; then
+        echo -e "${red}systemd 未能识别 Sing2.service${plain}"
+        echo -e "  unit 文件前几行："
+        sed -n '1,6p' /etc/systemd/system/Sing2.service 2>/dev/null | sed 's/^/    /'
+        echo -e "  请连同 ${green}systemctl status Sing2${plain} 的输出一起反馈"
+        exit 1
+    fi
+
     systemctl enable Sing2 >/dev/null 2>&1
     echo -e "${green}Sing2 ${last_version}${plain} 安装完成，已设置开机自启"
 
     # 管理脚本
-    if wget -q --no-check-certificate -O /usr/bin/sing2 \
-        "https://raw.githubusercontent.com/${SCRIPT_REPO}/master/Sing2.sh"; then
+    if fetch "https://raw.githubusercontent.com/${SCRIPT_REPO}/master/Sing2.sh" /usr/bin/sing2; then
         chmod +x /usr/bin/sing2
         ln -sf /usr/bin/sing2 /usr/bin/Sing2   # 大小写兼容
     else

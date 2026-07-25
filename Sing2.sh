@@ -133,14 +133,21 @@ start() {
     if [[ $? == 0 ]]; then
         echo -e "${green}Sing2 已在运行，无需再次启动${plain}"
     else
-        systemctl start ${SERVICE}
+        local out
+        out=$(systemctl start ${SERVICE} 2>&1)
         sleep 2
         check_status
-        if [[ $? == 0 ]]; then
-            echo -e "${green}Sing2 启动成功，请用 sing2 log 查看运行日志${plain}"
-        else
-            echo -e "${red}Sing2 启动失败${plain}，请用 sing2 log 查看日志"
-        fi
+        case $? in
+            0) echo -e "${green}Sing2 启动成功，请用 sing2 log 查看运行日志${plain}" ;;
+            2) echo; diagnose_missing_unit ;;
+            *)
+                echo -e "${red}Sing2 启动失败${plain}"
+                [[ -n "$out" ]] && echo -e "  systemctl: ${out}"
+                echo -e "  最近日志："
+                journalctl -u ${SERVICE}.service -n 20 --no-pager 2>/dev/null | sed 's/^/    /'
+                echo -e "  配置自检：${green}${BIN} serve -c ${CONF} ${plain}（前台跑，Ctrl-C 退出）"
+                ;;
+        esac
     fi
     [[ $# == 0 ]] && before_show_menu
 }
@@ -175,8 +182,8 @@ status() {
 }
 
 enable() {
-    systemctl enable ${SERVICE}
-    if [[ $? == 0 ]]; then
+    systemctl enable ${SERVICE} 2>&1 | sed 's/^/  /'
+    if [[ ${PIPESTATUS[0]} == 0 ]]; then
         echo -e "${green}Sing2 设置开机自启成功${plain}"
     else
         echo -e "${red}Sing2 设置开机自启失败${plain}"
@@ -195,7 +202,17 @@ disable() {
 }
 
 show_log() {
-    journalctl -u ${SERVICE}.service -e --no-pager -f
+    check_status
+    if [[ $? == 2 ]]; then
+        diagnose_missing_unit
+        [[ $# == 0 ]] && before_show_menu
+        return 1
+    fi
+    # 先回放最近 50 行再跟随。原来的 `-e -f` 在 unit 从未启动过时只会打印一行
+    # "Logs begin at ..." 然后干等，看起来像卡住。
+    journalctl -u ${SERVICE}.service -n 50 --no-pager
+    echo -e "${yellow}--- 以下为实时日志，Ctrl-C 退出 ---${plain}"
+    journalctl -u ${SERVICE}.service -f --no-pager
     [[ $# == 0 ]] && before_show_menu
 }
 
@@ -204,25 +221,68 @@ install_bbr() {
 }
 
 update_shell() {
-    wget -O /usr/bin/sing2 -N --no-check-certificate \
-        "https://raw.githubusercontent.com/${SCRIPT_REPO}/master/Sing2.sh"
-    if [[ $? != 0 ]]; then
-        echo ""
-        echo -e "${red}下载脚本失败，请检查本机能否连接 GitHub${plain}"
-        before_show_menu
-    else
+    # 先下到临时文件再替换：直接 `wget -O /usr/bin/sing2` 会在下载开始前清空目标，
+    # 中途失败就把管理脚本本身变成一个 0 字节文件，连重试都没得用。
+    local tmpf
+    tmpf=$(mktemp) || { echo -e "${red}无法创建临时文件${plain}"; before_show_menu; return 1; }
+    if curl -fsSL --retry 3 --connect-timeout 15 -o "$tmpf" \
+        "https://raw.githubusercontent.com/${SCRIPT_REPO}/master/Sing2.sh" && [[ -s "$tmpf" ]]; then
+        mv -f "$tmpf" /usr/bin/sing2
         chmod +x /usr/bin/sing2
         ln -sf /usr/bin/sing2 /usr/bin/Sing2
         echo -e "${green}升级脚本成功，请重新运行脚本${plain}" && exit 0
+    else
+        rm -f "$tmpf"
+        echo ""
+        echo -e "${red}下载脚本失败，请检查本机能否连接 GitHub${plain}"
+        before_show_menu
     fi
 }
 
 # 0: running, 1: not running, 2: not installed
+#
+# 「已安装」以 **systemd 是否登记了这个 unit** 为准，而不是「文件在不在」。
+# 一个写坏/写空/未 daemon-reload 的 unit 文件会让文件判断说"已安装、未运行"，
+# 而 systemctl start 说 "Unit not found" —— 两个结论互相矛盾，运维无从下手。
 check_status() {
-    [[ ! -f /etc/systemd/system/${SERVICE}.service ]] && return 2
+    if ! systemctl list-unit-files 2>/dev/null | grep -q "^${SERVICE}\.service"; then
+        return 2
+    fi
     local temp
     temp=$(systemctl is-active ${SERVICE} 2>/dev/null)
     [[ x"${temp}" == x"active" ]] && return 0 || return 1
+}
+
+# diagnose 在 systemd 不认识这个 unit 时，把「为什么」直接摆出来。
+# 没有它的话，用户只会看到 "not found"，而 `sing2 log` 又是空的（journal 里根本
+# 没有这个 unit 的记录），排查就断在这里。
+diagnose_missing_unit() {
+    echo -e "${red}systemd 不认识 ${SERVICE}.service${plain}"
+    echo
+    if [[ -f /etc/systemd/system/${SERVICE}.service ]]; then
+        local sz
+        sz=$(stat -c%s /etc/systemd/system/${SERVICE}.service 2>/dev/null)
+        echo -e "  unit 文件存在（${sz} 字节），但 systemd 没登记它。常见原因："
+        if [[ "${sz}" == "0" ]]; then
+            echo -e "    ${yellow}→ 文件是空的${plain}（多半是下载中断留下的残骸）"
+        fi
+        # CRLF 检测不用 grep：某些环境的 grep 会把文件当文本、把 CR 吃掉，
+        # 检测就静默失效了。读首行判尾字符不依赖任何文本处理。
+        local first
+        IFS= read -r first < /etc/systemd/system/${SERVICE}.service 2>/dev/null
+        if [[ "${first}" == *$'\r' ]]; then
+            echo -e "    ${yellow}→ 文件是 CRLF 行尾${plain}，systemd 解析不了"
+        fi
+        echo -e "    → 或者装完没执行 systemctl daemon-reload"
+        echo
+        echo -e "  文件前几行："
+        sed -n '1,6p' /etc/systemd/system/${SERVICE}.service | sed 's/^/    /'
+    else
+        echo -e "  /etc/systemd/system/${SERVICE}.service ${yellow}不存在${plain} —— 安装没有完成。"
+    fi
+    echo
+    echo -e "  ${green}重装即可修复：${plain}sing2 install"
+    echo -e "  （配置 ${CONF_DIR}/config.yml 会保留）"
 }
 
 check_enabled() {
@@ -246,7 +306,7 @@ check_install() {
     check_status
     if [[ $? == 2 ]]; then
         echo ""
-        echo -e "${red}请先安装 Sing2${plain}"
+        diagnose_missing_unit
         [[ $# == 0 ]] && before_show_menu
         return 1
     fi
