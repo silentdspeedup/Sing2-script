@@ -213,6 +213,20 @@ disable() {
     [[ $# == 0 ]] && before_show_menu
 }
 
+# config_log_path 取出 config.yml 里某个日志路径键的当前值。
+# 只认**未被注释**的值：`ErrorPath: # /etc/Sing2/error.log` 这种形状是"没配置"。
+config_log_path() {
+    local key=$1 line val
+    [[ -f "$CONF" ]] || return 1
+    line=$(grep -E "^[[:space:]]*${key}:" "$CONF" 2>/dev/null | grep -vE "^[[:space:]]*#" | tail -1)
+    [[ -n "$line" ]] || return 1
+    val=${line#*:}
+    val=${val%%#*}
+    val=$(printf '%s' "$val" | tr -d "\"' \t\r")
+    [[ -n "$val" ]] || return 1
+    echo "$val"
+}
+
 show_log() {
     check_status
     if [[ $? == 2 ]]; then
@@ -220,11 +234,35 @@ show_log() {
         [[ $# == 0 ]] && before_show_menu
         return 1
     fi
-    # 先回放最近 50 行再跟随。原来的 `-e -f` 在 unit 从未启动过时只会打印一行
-    # "Logs begin at ..." 然后干等，看起来像卡住。
+
+    # 配了 Log.ErrorPath 之后日志就**分成两半**：sing-box 侧全部写进那个文件、
+    # 不再进 journald，而 Sing2 自己的 [panel] 行走 stdout、仍在 journald。
+    # 只看其中一半会漏掉另一半，所以两边一起跟。
+    local errlog
+    errlog=$(config_log_path "ErrorPath") || errlog=""
+
     journalctl -u ${SERVICE}.service -n 50 --no-pager
+    if [[ -n "$errlog" && -f "$errlog" ]]; then
+        echo
+        echo -e "${yellow}--- ${errlog} 最近 50 行 ---${plain}"
+        tail -n 50 "$errlog"
+    elif [[ -n "$errlog" ]]; then
+        echo -e "${yellow}提示：配置指向 ${errlog}，但该文件尚不存在（还没产生日志）${plain}"
+    fi
+
     echo -e "${yellow}--- 以下为实时日志，Ctrl-C 退出 ---${plain}"
-    journalctl -u ${SERVICE}.service -f --no-pager
+    if [[ -n "$errlog" && -f "$errlog" ]]; then
+        # -F 而不是 -f：logrotate 用的是 copytruncate，文件会被就地截断，
+        # -F 会跟着重新打开，-f 则会一直读一个已经变空的 fd。
+        tail -n 0 -F "$errlog" &
+        local tailpid=$!
+        trap 'kill "$tailpid" 2>/dev/null' EXIT INT TERM
+        journalctl -u ${SERVICE}.service -f --no-pager
+        kill "$tailpid" 2>/dev/null
+        trap - EXIT INT TERM
+    else
+        journalctl -u ${SERVICE}.service -f --no-pager
+    fi
     [[ $# == 0 ]] && before_show_menu
 }
 

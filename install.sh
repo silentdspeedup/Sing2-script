@@ -165,24 +165,6 @@ relabel_unit() {
     fi
 }
 
-# read_log_path 从 config.yml 里取出一个日志路径键的值。
-# 只认**未被注释**的值：示例配置里这两个键默认是 `AccessPath: # /etc/Sing2/access.log`
-# 这种形状——键在、值被注释掉——那种情况要当作"没配置"，回落默认路径。
-read_log_path() {
-    local key=$1 line val
-    [[ -f "${CONF_DIR}/config.yml" ]] || return 1
-    line=$(grep -E "^[[:space:]]*${key}:" "${CONF_DIR}/config.yml" 2>/dev/null |
-        grep -vE "^[[:space:]]*#" | tail -1)
-    [[ -n "$line" ]] || return 1
-    val=${line#*:}          # 去掉键
-    val=${val%%#*}          # 去掉行尾注释
-    # 引号与空白一次去掉。用 tr 而不是 ${var//.../}——后者要在这里写裸单引号，
-    # 之前就在这条上写出过把整个文件吞掉的语法错误。
-    val=$(printf '%s' "$val" | tr -d "\"' \t\r")
-    [[ -n "$val" ]] || return 1
-    echo "$val"
-}
-
 # install_logrotate 生成 /etc/logrotate.d/Sing2。
 #
 # 几个选择的理由：
@@ -196,15 +178,17 @@ read_log_path() {
 #                    找日志比按序号直观，且序号会随每次轮转平移。
 #   noolddir      —— 就地保留，不搬到别处（与 XrayR 习惯一致）。
 #   maxsize       —— 见下方注释：只有在 logrotate 跑得比每天更勤时才有额外意义。
+#
+# 路径与 config.yml 里 Log.AccessPath / Log.ErrorPath 的出厂值一一对应，
+# 都固定在 ${CONF_DIR} 下。改了配置里的路径就自己调这份文件。
 install_logrotate() {
     command -v logrotate >/dev/null 2>&1 || {
         echo -e "${yellow}未安装 logrotate，跳过日志轮转配置${plain}"
         return 0
     }
 
-    local access error
-    access=$(read_log_path "AccessPath") || access="${CONF_DIR}/access.log"
-    error=$(read_log_path "ErrorPath") || error="${CONF_DIR}/error.log"
+    local access="${CONF_DIR}/access.log"
+    local error="${CONF_DIR}/error.log"
 
     cat > /etc/logrotate.d/Sing2 <<EOF
 ${access}

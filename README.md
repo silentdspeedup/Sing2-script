@@ -56,7 +56,9 @@ sing2 version      查看版本
 | `/etc/Sing2/config.yml` | 配置文件（升级不覆盖，权限 600） |
 | `/etc/systemd/system/Sing2.service` | systemd 单元 |
 | `/usr/bin/sing2` | 本管理脚本 |
-| `/etc/logrotate.d/Sing2` | 日志轮转配置（见下节） |
+| `/etc/Sing2/error.log` | 运行日志（sing-box 侧） |
+| `/etc/Sing2/access.log` | 逐连接访问日志 |
+| `/etc/logrotate.d/Sing2` | 日志轮转配置 |
 
 卸载**不会**删除 `/etc/Sing2`（里面有配置和证书）。要彻底清除自行 `rm -rf /etc/Sing2`。
 
@@ -86,20 +88,38 @@ sing2 version      查看版本
   `BufferSize` 是 xray policy 的设置，sing-box 没有 policy 这一层，写进去不生效，
   但启动时会逐条告警说明替代方案，不会静默吞掉。
 
-## 日志轮转
+## 日志
 
-安装脚本会自动装好 `logrotate` 并写入 `/etc/logrotate.d/Sing2`：**每天轮转、gzip 压缩、
-就地存放、保留 7 份**。文件名带日期（`access.log-20260726.gz`），比序号直观，也不会
-因为每次轮转而整体平移。
+出厂配置默认开两个日志，路径**固定**：
 
-轮转的路径**从 `config.yml` 里读实际配置的 `AccessPath` / `ErrorPath`**，没配置就用默认的
-`/etc/Sing2/access.log`、`/etc/Sing2/error.log`。所以把日志挪到 `/var/log/` 之后重装一次
-（或 `sing2 update`）就会跟着走。
+| 文件 | 内容 |
+|---|---|
+| `/etc/Sing2/error.log` | 运行日志（sing-box 侧） |
+| `/etc/Sing2/access.log` | 逐连接访问日志，XrayR 行格式 |
 
-写完会用 `logrotate -d` 自检一遍语法——一份写坏的配置会让**系统上所有**轮转任务一起失败，
-不能只写不验。自检不过就删掉并打印原因。
+⚠ **配了 `ErrorPath` 之后日志就分成两半**：sing-box 侧全部写进那个文件、不再进 journald，
+而 Sing2 自己的 `[panel]` 行走 stdout、仍在 journald。`sing2 log` 已经会**同时跟随两边**，
+所以照常用它即可；手动看的话两条都要：
 
-### 为什么是 copytruncate
+```bash
+journalctl -u Sing2 -f          # [panel] 层
+tail -F /etc/Sing2/error.log    # sing-box 层
+```
+
+不想要这种切分就把 `ErrorPath` 留空，全部回到 journald。
+
+### 轮转
+
+安装脚本自动装 `logrotate` 并写入 `/etc/logrotate.d/Sing2`：**每天轮转、gzip 压缩、就地存放、
+保留 7 份**。文件名带日期（`access.log-20260726.gz`），比序号直观，也不会因为每次轮转而整体平移。
+
+写完会用 `logrotate -d` 自检语法——一份写坏的配置会让**系统上所有**轮转任务一起失败，不能只写
+不验。自检不过就删掉并打印原因。
+
+路径与出厂配置一一对应，都固定在 `/etc/Sing2/` 下。**改了 config.yml 里的日志路径，记得同步改**
+`/etc/logrotate.d/Sing2`。
+
+#### 为什么是 copytruncate
 
 Sing2 全程持有日志文件描述符。logrotate 默认的 `create` 模式会先 rename 旧文件再建新文件，
 而 Sing2 仍在写那个已被改名的 inode——轮转之后新文件会永远是空的。`copytruncate` 是复制后
@@ -108,7 +128,7 @@ Sing2 全程持有日志文件描述符。logrotate 默认的 `create` 模式会
 （也因此**没有加 `delaycompress`**：那是给 `create` 模式用的，`copytruncate` 下副本在压缩前
 已经完整，加了只是白白多留一个未压缩文件。）
 
-### 访问日志涨得快的节点
+#### 访问日志涨得快的节点
 
 系统的 logrotate 通常每天只跑一次（`cron.daily` 或 `logrotate.timer`），所以配置里的
 `maxsize 512M` 在默认节奏下不会让它在日内提前轮转。用户量大的节点可以让它跑得更勤：
@@ -119,7 +139,7 @@ echo '0 * * * * root /usr/sbin/logrotate /etc/logrotate.d/Sing2' > /etc/cron.d/S
 
 改成每小时检查一次，超过 512M 就轮转，同时保持「每天至少一次」的下限。
 
-卸载 Sing2 时这份配置会一并删除。
+卸载 Sing2 时这份 logrotate 配置会一并删除。
 
 ## 与 XrayR 的差异
 
