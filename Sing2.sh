@@ -130,6 +130,7 @@ uninstall() {
     systemctl reset-failed
     rm -rf /usr/local/Sing2/
     rm -f /usr/bin/sing2 /usr/bin/Sing2
+    rm -f /etc/logrotate.d/Sing2   # 留着会让系统每天为不存在的日志跑一次轮转
 
     echo ""
     echo -e "${green}卸载成功${plain}"

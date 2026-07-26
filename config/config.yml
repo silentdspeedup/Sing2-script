@@ -17,8 +17,9 @@ Log:
   # 填了路径之后 sing-box 侧的日志就只进这个文件，不再进 journald。
   ErrorPath: # /etc/Sing2/error.log
   # 逐连接访问日志（XrayR 格式）。留空 = 不写。
-  #   2026/07/26 00:00:08.938213 from 1.2.3.4:16223 accepted tcp:1.1.1.1:53   #     [V2ray_0.0.0.0_15180 >> direct] email: V2ray_0.0.0.0_15180|a@b.com|11221
-  # email 字段是完整 join key，用户邮箱与 uid 都在里面。
+  #   2026/07/26 21:28:32.280338 from 120.192.185.114:57046 accepted tcp:1.1.1.1:53   #     [Mieru_0.0.0.0_2999 >> direct] email: 1165394586@qq.com|7720
+  # email 字段是「邮箱|uid」；NodeTag 不重复写，它已经在 [in >> out] 那一列里。
+  # 客户端 IP 一律规范化：双栈监听下 IPv4 会被报成 ::ffff:1.2.3.4，这里还原成 1.2.3.4。
   # 注意：协议鉴权失败（invalid user）不会出现在这里——那类连接在 inbound 内部
   # 就被拒了，进不了路由，看普通运行日志（Level 调到 info/debug）。
   # 不自带轮转，请用 logrotate。

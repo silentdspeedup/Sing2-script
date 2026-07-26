@@ -165,6 +165,79 @@ relabel_unit() {
     fi
 }
 
+# read_log_path 从 config.yml 里取出一个日志路径键的值。
+# 只认**未被注释**的值：示例配置里这两个键默认是 `AccessPath: # /etc/Sing2/access.log`
+# 这种形状——键在、值被注释掉——那种情况要当作"没配置"，回落默认路径。
+read_log_path() {
+    local key=$1 line val
+    [[ -f "${CONF_DIR}/config.yml" ]] || return 1
+    line=$(grep -E "^[[:space:]]*${key}:" "${CONF_DIR}/config.yml" 2>/dev/null |
+        grep -vE "^[[:space:]]*#" | tail -1)
+    [[ -n "$line" ]] || return 1
+    val=${line#*:}          # 去掉键
+    val=${val%%#*}          # 去掉行尾注释
+    # 引号与空白一次去掉。用 tr 而不是 ${var//.../}——后者要在这里写裸单引号，
+    # 之前就在这条上写出过把整个文件吞掉的语法错误。
+    val=$(printf '%s' "$val" | tr -d "\"' \t\r")
+    [[ -n "$val" ]] || return 1
+    echo "$val"
+}
+
+# install_logrotate 生成 /etc/logrotate.d/Sing2。
+#
+# 几个选择的理由：
+#   copytruncate  —— **必须**。Sing2 全程持有日志 fd，默认的 create 模式会 rename
+#                    旧文件再建新文件，而 Sing2 仍写向那个已被改名的 inode，轮转后
+#                    新文件永远是空的。代价是 cp 与 truncate 之间有个极窄的写入窗口
+#                    可能丢几行——对访问日志可以接受。
+#   不加 delaycompress —— 那是给 create 模式用的（进程还握着旧 fd，压缩会压到半截）。
+#                    copytruncate 下副本在压缩前就已完整，加了只是白留一个未压缩文件。
+#   dateext       —— 轮转出 access.log-20260726.gz 而不是 access.log.1.gz，按日期
+#                    找日志比按序号直观，且序号会随每次轮转平移。
+#   noolddir      —— 就地保留，不搬到别处（与 XrayR 习惯一致）。
+#   maxsize       —— 见下方注释：只有在 logrotate 跑得比每天更勤时才有额外意义。
+install_logrotate() {
+    command -v logrotate >/dev/null 2>&1 || {
+        echo -e "${yellow}未安装 logrotate，跳过日志轮转配置${plain}"
+        return 0
+    }
+
+    local access error
+    access=$(read_log_path "AccessPath") || access="${CONF_DIR}/access.log"
+    error=$(read_log_path "ErrorPath") || error="${CONF_DIR}/error.log"
+
+    cat > /etc/logrotate.d/Sing2 <<EOF
+${access}
+${error}
+{
+    daily
+    rotate 7
+    compress
+    copytruncate
+    dateext
+    dateformat -%Y%m%d
+    notifempty
+    missingok
+    noolddir
+    su root root
+    # 上限保护。注意：系统的 logrotate 通常每天只跑一次（cron.daily 或
+    # logrotate.timer），此时 maxsize 不会在日内提前触发。访问日志涨得快的
+    # 节点可以让它跑得更勤，见 README「日志轮转」一节。
+    maxsize 512M
+}
+EOF
+    chmod 644 /etc/logrotate.d/Sing2
+
+    # 语法自检：写坏了会让**系统全部**日志轮转任务一起失败，不能只写不验。
+    if logrotate -d /etc/logrotate.d/Sing2 >/dev/null 2>&1; then
+        echo -e "${green}日志轮转已配置${plain}：${access}、${error}（每天，保留 7 份，gzip 压缩，就地存放）"
+    else
+        echo -e "${red}logrotate 配置自检未通过${plain}，已删除以免影响系统其它轮转任务："
+        logrotate -d /etc/logrotate.d/Sing2 2>&1 | sed 's/^/  /' | head -10
+        rm -f /etc/logrotate.d/Sing2
+    fi
+}
+
 # install_unit 把 unit 装好并**验证 systemd 真的能用它**，不行就自愈重写。
 # 只写文件不验证，会把「装了但起不来」这种最难查的状态留给用户。
 install_unit() {
@@ -209,10 +282,10 @@ install_unit() {
 install_base() {
     if [[ x"${release}" == x"centos" ]]; then
         yum install epel-release -y
-        yum install wget curl unzip tar crontabs socat ca-certificates -y
+        yum install wget curl unzip tar crontabs socat ca-certificates logrotate -y
     else
         apt-get update -y
-        apt-get install wget curl unzip tar cron socat ca-certificates -y
+        apt-get install wget curl unzip tar cron socat ca-certificates logrotate -y
     fi
 }
 
@@ -338,6 +411,9 @@ install_Sing2() {
             echo -e "${red}Sing2 可能启动失败${plain}，请用 ${green}sing2 log${plain} 查看日志"
         fi
     fi
+
+    # 日志轮转。放在配置落地之后——它要从 config.yml 里读实际的日志路径。
+    install_logrotate
 
     cd "$cur_dir" || exit 1
     rm -f install.sh
