@@ -13,8 +13,13 @@
 
 Log:
   Level: warning # none / error / warning / info / debug
-  AccessPath: # /etc/Sing2/access.log
+  # 日志文件。留空 = 写 stdout，由 systemd 收进 journald，用 `sing2 log` 看。
+  # 填了路径之后 sing-box 侧的日志就只进这个文件，不再进 journald。
   ErrorPath: # /etc/Sing2/error.log
+  # AccessPath 无对应能力，写了会告警：sing-box 没有独立的访问日志文件，
+  # 连接日志就在普通日志流里——把 Level 调到 info/debug 即可看到，
+  # 会写进上面 ErrorPath 指定的位置。要把访问记录上报给面板用下面的 AccessLog。
+  AccessPath:
 
 # 访问日志上报（进程级，可选）。面板需实现 POST /mod_mu/users/accesslog。
 AccessLog:
@@ -60,6 +65,12 @@ Nodes:
       # 合并语义：私钥 / Dest 取本地；ServerNames / ShortIds 优先取面板下发，
       # 因此一份 REALITYConfigs 可服务多个 REALITY 节点。
       EnableREALITY: false
+      # ⚠ 传统面板下必须保持 false。设成 true 会跳过整个本地合并，于是
+      #   Dest 和 PrivateKey 都为空——而 6 段式 server 串只带客户端那一半
+      #   （servername / reality_short_id / reality_public_key），给不出这两个值，
+      #   节点会直接起不来（报 "REALITY dest is empty"）。
+      #   它只对 native 方言有意义：那里面板体本身就是完整的 sing-box inbound，
+      #   自带 tls.reality{}（含 private_key）。
       DisableLocalREALITYConfig: false
       REALITYConfigs:
         Show: false
