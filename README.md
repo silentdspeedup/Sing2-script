@@ -93,6 +93,7 @@ sing2 version      查看版本
 | 配置路径 | `/etc/XrayR/config.yml` | `/etc/Sing2/config.yml` |
 | 面板 | SSpanel / V2board / PMpanel / Proxypanel | 仅 SSpanel（mod_mu 系，两代都支持） |
 | 并发连接数上限 | 无 | 有（`ConnLimitConfig`） |
+| 跨节点设备限 | 面板 `alive_ip` 或 Redis 二选一 | 只走面板 `alive_ip`（Redis 通路已移除） |
 | 访问日志上报 | 定制版有 | 有（`AccessLog`） |
 | 用户增删 | 动态 | 动态，且**已建立连接不中断**（全 9 协议） |
 

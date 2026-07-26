@@ -1,8 +1,7 @@
 # Sing2 配置示例
 # SPDX-License-Identifier: GPL-3.0-or-later
 #
-# 字段规范见 doc/09-config-and-migration.md。本文件只包含**已实现**的配置项
-# （`ConnectionConfig` 仍未实现，故刻意不出现——写进去会被静默忽略）。
+# 字段规范见 doc/09-config-and-migration.md。本文件只包含**已实现**的配置项。
 #
 # 与 XrayR config.yml 的差异：
 #   - 删除 DnsConfigPath / InboundConfigPath / OutboundConfigPath /
@@ -10,6 +9,7 @@
 #     写在本文件里（DnsConfig / OutboundConfig / RouteConfig，见文件末尾）
 #   - PanelType 只支持 SSpanel（mod_mu 系，含传统 SSpanel 与 Phoenix 两代）
 #   - 新增 AccessLog（访问日志上报）、ConnLimitConfig（并发连接数上限）
+#   - ConnectionConfig 字段与 XrayR 不同（xray policy 无对应），见文件末尾
 
 Log:
   Level: warning # none / error / warning / info / debug
@@ -82,16 +82,12 @@ Nodes:
         LimitSpeed: 0 # Mbps
         LimitDuration: 0 # 分钟
 
-      # 跨节点在线设备数限制（需要 Redis）
-      GlobalDeviceLimitConfig:
-        Enable: false
-        RedisNetwork: tcp
-        RedisAddr: 127.0.0.1:6379
-        RedisUsername:
-        RedisPassword:
-        RedisDB: 0
-        Timeout: 5
-        Expiry: 60
+      # 跨节点在线设备数限制：不在这里配置。
+      # SSpanel 系（传统 SSpanel / Phoenix 都是）自带这条通路——各节点上报在线 IP，
+      # 面板汇总出全网 alive_ip 再随用户列表下发，节点按
+      # node_iplimit − alive_ip + 本节点上次上报数 算出本节点还能给几个设备。
+      # 每用户上限在面板的 node_iplimit 里设；想在节点侧统一压低用 ApiConfig.DeviceLimit。
+      # XrayR 的 GlobalDeviceLimitConfig（Redis 通路）已移除，写在这里会被忽略。
 
       # 每用户并发连接数上限（Sing2 净新增，XrayR 无此能力）
       ConnLimitConfig:
@@ -225,3 +221,43 @@ Nodes:
 #         format: binary
 #         path: /etc/Sing2/geosite-cn.srs
 # 规则集索引：https://github.com/SagerNet/sing-geosite ／ sing-geoip
+
+# ---------------------------------------------------------------------------
+# 【可选】连接调优（doc/09 §4.2）
+# ---------------------------------------------------------------------------
+# 整块可省略，省略即完全沿用基座默认。单位一律是整数秒。
+# 一份策略作用于所有节点的所有 inbound；面板显式下发的同名字段优先。
+#
+# ConnectionConfig:
+#   UDPTimeout: 300            # UDP 会话空闲多久回收（基座默认约 300）
+#   TCPKeepAlive: 15           # 空闲多久发第一个保活探测
+#   TCPKeepAliveInterval: 15   # 探测之间的间隔
+#   DisableTCPKeepAlive: false # 完全关掉保活探测
+#
+# ⚠ 从 XrayR 迁过来的注意：XrayR 的 Handshake / ConnIdle / UplinkOnly /
+#   DownlinkOnly / BufferSize 是 xray policy 的设置，sing-box 没有 policy 这一层，
+#   这五个字段**没有对应能力**。写在这里不会报错，但也不会生效——启动时会逐条
+#   告警说明该用什么替代。特别是 ConnIdle：不要直接把它的数值搬到 UDPTimeout，
+#   xray 的 connIdle 默认 30 秒且同时管 TCP，照搬会让 UDP 会话在 30 秒被切断。
+#   BufferSize 则只能靠 with_low_memory 构建标签调整（缓冲区是编译期常量）。
+
+# ---------------------------------------------------------------------------
+# 【可选，仅 Mieru 节点】用户提示强制（doc/09 §5.5）
+# ---------------------------------------------------------------------------
+# 写在 Nodes[].ControllerConfig 下面：
+#
+#   ControllerConfig:
+#     MieruUserHintIsMandatory: true
+#
+# 为什么可能需要：mieru 不在线上暴露身份，服务端只能逐个用户试解密。提示没命中
+# 时会兜底遍历全部用户，而探测/扫描类垃圾流量必然走这条路且永远认证不成功。
+# 用户越多越贵——实测 1000 用户时每次尝试约 2ms，是提示命中路径的 10 倍。
+# 开成 true 可彻底关掉这条兜底路径。
+#
+# ⚠ 代价：mieru < v3.31.0 的老客户端会**连不上**（硬中断，不是降级）。
+#   mihomo 当前用 v3.34.0，不受影响。
+#
+# 不设 = 听面板的（mieru_user_hint / user_hint_is_mandatory）。
+#
+# 先看数据再开：节点每 5 分钟会评估一次，healthy 时完全静默；真被这条路径吃
+# CPU 时会打印带 “全量试解密” 计数的警告并给出处置建议。
