@@ -13,13 +13,19 @@
 
 Log:
   Level: warning # none / error / warning / info / debug
-  # 日志文件。留空 = 写 stdout，由 systemd 收进 journald，用 `sing2 log` 看。
+  # 运行日志文件。留空 = 写 stdout，由 systemd 收进 journald，用 `sing2 log` 看。
   # 填了路径之后 sing-box 侧的日志就只进这个文件，不再进 journald。
   ErrorPath: # /etc/Sing2/error.log
-  # AccessPath 无对应能力，写了会告警：sing-box 没有独立的访问日志文件，
-  # 连接日志就在普通日志流里——把 Level 调到 info/debug 即可看到，
-  # 会写进上面 ErrorPath 指定的位置。要把访问记录上报给面板用下面的 AccessLog。
-  AccessPath:
+  # 逐连接访问日志（XrayR 格式）。留空 = 不写。
+  #   2026/07/26 00:00:08.938213 from 1.2.3.4:16223 accepted tcp:1.1.1.1:53   #     [V2ray_0.0.0.0_15180 >> direct] email: V2ray_0.0.0.0_15180|a@b.com|11221
+  # email 字段是完整 join key，用户邮箱与 uid 都在里面。
+  # 注意：协议鉴权失败（invalid user）不会出现在这里——那类连接在 inbound 内部
+  # 就被拒了，进不了路由，看普通运行日志（Level 调到 info/debug）。
+  # 不自带轮转，请用 logrotate。
+  AccessPath: # /etc/Sing2/access.log
+  # 访问日志时间戳的时区。留空 = 本机时区。
+  # 固定偏移（+08:00 / +0800 / +8）永远可用；Asia/Shanghai 这类 IANA 名需系统有 tzdata。
+  Timezone: # +08:00
 
 # 访问日志上报（进程级，可选）。面板需实现 POST /mod_mu/users/accesslog。
 AccessLog:
