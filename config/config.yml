@@ -70,7 +70,16 @@ Nodes:
       UpdatePeriodic: 60 # 面板同步周期（秒）
       EnableDNS: false
       DNSType: AsIs # AsIs / UseIP / UseIPv4 / UseIPv6
+      # 接受入站 PROXY protocol，可与 haproxy 的 send-proxy 配合（doc/09 §5.3）。
+      # 覆盖 vless / vmess / trojan / shadowsocks / anytls / mieru / trusttunnel；
+      # hysteria2 / tuic 是 QUIC，PROXY protocol 只管 TCP，对它们开会直接报错。
+      # 没带 PROXY 头的连接照常服务，用真实 socket 地址。
+      #
+      # ⚠ 谁发的头都信。PROXY 头是未经认证的身份声明，任何能连上这个端口的人都能
+      #   声称自己是任意 IP，从而绕过设备上限、污染访问日志、让溯源失效。
+      #   **请用防火墙或私网把该端口限制到你的负载均衡器**——这是唯一的防线。
       EnableProxyProtocol: false
+      # EnableFallback 未接线（基座只有 Trojan 还保留回落）。
       EnableFallback: false
 
       # 节点本地 REALITY。私钥只能放在这里——面板的 server 串同时用于渲染用户
