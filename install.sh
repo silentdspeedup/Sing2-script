@@ -165,6 +165,112 @@ relabel_unit() {
     fi
 }
 
+# config_log_path 取出 config.yml 里某个日志路径键的当前值（与 Sing2.sh 同名函数同规则）。
+# 只认**未被注释**的值：`ErrorPath: # /etc/Sing2/error.log` 这种形状算「没配置」，
+# 因为 sing2 generate 生成的就是这个形状——日志全走 journald，磁盘上没有文件。
+config_log_path() {
+    local key=$1 line val conf="${CONF_DIR}/config.yml"
+    [[ -f "$conf" ]] || return 1
+    line=$(grep -E "^[[:space:]]*${key}:" "$conf" 2>/dev/null | grep -vE "^[[:space:]]*#" | tail -1)
+    [[ -n "$line" ]] || return 1
+    val=${line#*:}
+    val=${val%%#*}
+    val=$(printf '%s' "$val" | tr -d "\"' \t\r")
+    [[ -n "$val" ]] || return 1
+    echo "$val"
+}
+
+# ensure_logrotate_driver —— 找出「谁会来跑 logrotate」，能修就修，找不到就说实话。
+#
+# 这一步在 2026-07-29 之前是缺的，而缺的正是最要紧的那一半：install_logrotate 只用
+# `logrotate -d` 验证配置**能被解析**，然后就打印「日志轮转已配置」。可 logrotate 本身
+# 不是守护进程，它靠系统的调度器每天叫它一次；配置写得再对，没人叫它就永远不轮转，
+# 而 access.log 在有量的节点上涨得很快。于是「装完看着一切正常，一个月后磁盘满了」。
+#
+# 两条驱动链路，按发行版分：
+#   - logrotate.timer  —— Debian 11+ / Ubuntu 21.10+ / RHEL 9+ 等较新发行版
+#   - /etc/cron.daily/logrotate —— 较老的发行版，由 crond/cron 每天扫一次
+# 两者都可能「文件在、服务没启用」，最小化镜像和容器里尤其常见——包管理器把包装上了
+# 不等于调度器在跑。
+#
+# 回显驱动名到 stdout，返回 0；一个都找不到返回 1。安装器已经要求 systemd（unit 靠它），
+# 所以这里可以放心用 systemctl。
+ensure_logrotate_driver() {
+    # 1) 发行版自带的 systemd timer。优先用它——这是 Debian 11+ / Ubuntu 21.10+ /
+    #    RHEL 8+ 的正规路径，也是我们最不该去抢的那条。
+    if systemctl cat logrotate.timer >/dev/null 2>&1; then
+        systemctl is-active logrotate.timer >/dev/null 2>&1 ||
+            systemctl enable --now logrotate.timer >/dev/null 2>&1
+        if systemctl is-active logrotate.timer >/dev/null 2>&1; then
+            echo "logrotate.timer"
+            return 0
+        fi
+    fi
+
+    # 2) cron.daily。⚠ 文件在 ≠ 会执行：Debian/Ubuntu 的 /etc/cron.daily/logrotate
+    #    开头就是「systemd 当 init 就 exit 0，交给 timer」。所以在 timer 被 disable/mask
+    #    的 systemd 机器上，这个脚本存在但**故意什么都不做**，把它当驱动就是报假喜。
+    #    只有在它不会让位给 systemd 时才算数。
+    if [[ -x /etc/cron.daily/logrotate ]] &&
+       ! grep -q '/run/systemd/system' /etc/cron.daily/logrotate 2>/dev/null; then
+        local svc
+        for svc in crond cron; do
+            systemctl cat "$svc" >/dev/null 2>&1 || continue
+            systemctl is-active "$svc" >/dev/null 2>&1 ||
+                systemctl enable --now "$svc" >/dev/null 2>&1
+            if systemctl is-active "$svc" >/dev/null 2>&1; then
+                echo "${svc} → /etc/cron.daily/logrotate"
+                return 0
+            fi
+        done
+    fi
+
+    # 3) 都没有：自己装一个 timer 只管我们这份配置。
+    #
+    # 与其去分辨 EL7 的 cron.d/0hourly→anacron→run-parts、各家 logrotate 包到底把
+    # 触发器放哪、最小化镜像裁掉了什么，不如把这件事变成确定的：安装器本来就要求
+    # systemd（Sing2.service 靠它），那就用 systemd。只在前两条都不成立时才装，
+    # 免得和发行版自己的轮转重复触发——日内两次轮转会撞上 dateext 的同名文件。
+    cat > /etc/systemd/system/Sing2-logrotate.service <<'UNIT'
+[Unit]
+Description=Rotate Sing2 logs
+Documentation=https://github.com/silentdspeedup/Sing2-script
+
+[Service]
+Type=oneshot
+ExecStart=/usr/sbin/logrotate /etc/logrotate.d/Sing2
+UNIT
+    cat > /etc/systemd/system/Sing2-logrotate.timer <<'UNIT'
+[Unit]
+Description=Daily rotation of Sing2 logs
+
+[Timer]
+OnCalendar=daily
+AccuracySec=1h
+Persistent=true
+
+[Install]
+WantedBy=timers.target
+UNIT
+    # logrotate 未必在 /usr/sbin。ExecStart 路径错了 systemd 会把 unit 记成 bad，
+    # 那就又回到「装了但不跑」，所以按实际位置修正。
+    local lr
+    lr=$(command -v logrotate 2>/dev/null)
+    if [[ -n "$lr" && "$lr" != "/usr/sbin/logrotate" ]]; then
+        sed -i "s#^ExecStart=.*#ExecStart=${lr} /etc/logrotate.d/Sing2#" \
+            /etc/systemd/system/Sing2-logrotate.service
+    fi
+    systemctl daemon-reload >/dev/null 2>&1
+    if systemctl enable --now Sing2-logrotate.timer >/dev/null 2>&1 &&
+       systemctl is-active Sing2-logrotate.timer >/dev/null 2>&1; then
+        echo "Sing2-logrotate.timer（本脚本自建——系统没有可用的轮转驱动）"
+        return 0
+    fi
+    rm -f /etc/systemd/system/Sing2-logrotate.timer /etc/systemd/system/Sing2-logrotate.service
+    systemctl daemon-reload >/dev/null 2>&1
+    return 1
+}
+
 # install_logrotate 生成 /etc/logrotate.d/Sing2。
 #
 # 几个选择的理由：
@@ -187,8 +293,13 @@ install_logrotate() {
         return 0
     }
 
-    local access="${CONF_DIR}/access.log"
-    local error="${CONF_DIR}/error.log"
+    # 路径取 config.yml 里**实际配置**的值，取不到才回落到出厂路径。
+    # 这里长期是硬编码的，而函数头和 README 都写着「从 config.yml 读实际路径」——
+    # 于是改过 Log.AccessPath 的人以为轮转跟着走了，实际上轮转盯着两个不存在的
+    # 文件空转（missingok 让它连句话都不说），真正在涨的那个没人管。
+    local access error
+    access=$(config_log_path AccessPath) || access="${CONF_DIR}/access.log"
+    error=$(config_log_path ErrorPath) || error="${CONF_DIR}/error.log"
 
     cat > /etc/logrotate.d/Sing2 <<EOF
 ${access}
@@ -206,19 +317,42 @@ ${error}
     su root root
     # 上限保护。注意：系统的 logrotate 通常每天只跑一次（cron.daily 或
     # logrotate.timer），此时 maxsize 不会在日内提前触发。访问日志涨得快的
-    # 节点可以让它跑得更勤，见 README「日志轮转」一节。
+    # 节点可以让它跑得更勤，见 README「日志轮转」一节——但**先把上面的
+    # dateformat 加上小时**（-%Y%m%d%H），否则日内第二次轮转会撞上已存在的
+    # 同名文件，logrotate 直接 skip，改勤了反而不轮转。
     maxsize 512M
 }
 EOF
     chmod 644 /etc/logrotate.d/Sing2
 
     # 语法自检：写坏了会让**系统全部**日志轮转任务一起失败，不能只写不验。
-    if logrotate -d /etc/logrotate.d/Sing2 >/dev/null 2>&1; then
-        echo -e "${green}日志轮转已配置${plain}：${access}、${error}（每天，保留 7 份，gzip 压缩，就地存放）"
-    else
+    if ! logrotate -d /etc/logrotate.d/Sing2 >/dev/null 2>&1; then
         echo -e "${red}logrotate 配置自检未通过${plain}，已删除以免影响系统其它轮转任务："
         logrotate -d /etc/logrotate.d/Sing2 2>&1 | sed 's/^/  /' | head -10
         rm -f /etc/logrotate.d/Sing2
+        return 0
+    fi
+
+    # 配置能解析 ≠ 会被执行。没有驱动就别报喜——那句「已配置」会让运维不再管这件事，
+    # 而真相是日志会一直涨到磁盘满。
+    local driver
+    if driver=$(ensure_logrotate_driver); then
+        echo -e "${green}日志轮转已配置${plain}：${access}、${error}（每天，保留 7 份，gzip 压缩，就地存放）"
+        echo -e "  由 ${green}${driver}${plain} 触发。logrotate 不是常驻进程，也不在 crontab 里——"
+        echo -e "  要确认它真的会跑：${green}sing2 status${plain}（会显示驱动与上次轮转时间）"
+        # 轮转配置正确 ≠ 有东西可轮转。sing2 generate 默认把两个日志路径都注释掉，
+        # 日志全进 journald，磁盘上根本没有这两个文件。不点破的话，用户会去
+        # /etc/Sing2 找 .gz 找不到，然后得出「轮转坏了」——症状和真坏一模一样。
+        if ! config_log_path AccessPath >/dev/null && ! config_log_path ErrorPath >/dev/null; then
+            echo -e "  ${yellow}注意：当前 config.yml 没有启用文件日志${plain}（Log.AccessPath / Log.ErrorPath 均为空），"
+            echo -e "  日志全部走 journald，这份轮转配置暂时空转。填上路径后自动生效。"
+        fi
+    else
+        echo -e "${yellow}日志轮转配置已写入，但系统上没有任何东西会执行它${plain}"
+        echo -e "  ${access}、${error} 会一直增长直到写满磁盘。"
+        echo -e "  既没有可用的 ${green}logrotate.timer${plain}，也没有在跑的 cron 提供 /etc/cron.daily。"
+        echo -e "  处理：装上并启用其一，例如 ${green}systemctl enable --now logrotate.timer${plain}；"
+        echo -e "  容器/最小化镜像里也可以由宿主定期执行 ${green}logrotate /etc/logrotate.d/Sing2${plain}"
     fi
 }
 
@@ -334,6 +468,11 @@ install_Sing2() {
     if [[ -n "$current" && "$current" == "$last_version" && "${FORCE}" != "1" ]]; then
         echo -e "${green}当前已是 ${last_version}，无需更新${plain}"
         install_manager
+        # 同版本路径也要跑：脚本层的修复本来就靠 `sing2 update` 下发（install_manager
+        # 就是为此才放在这里）。轮转配置同理——它可能被手删了、或者装的时候机器上
+        # 还没有可用的驱动。不在这里补，用户就只能靠 --force 重装本体才能修一份
+        # 与本体无关的配置。幂等，重复跑无副作用。
+        install_logrotate
         echo -e "如需强制重装本体：${yellow}bash install.sh ${last_version} --force${plain}"
         exit 10
     fi

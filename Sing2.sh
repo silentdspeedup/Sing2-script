@@ -131,6 +131,13 @@ uninstall() {
     rm -rf /usr/local/Sing2/
     rm -f /usr/bin/sing2 /usr/bin/Sing2
     rm -f /etc/logrotate.d/Sing2   # 留着会让系统每天为不存在的日志跑一次轮转
+    # 安装器在系统没有任何轮转驱动时会自建这个 timer（install.sh 的
+    # ensure_logrotate_driver 第 3 条）。多数机器上它不存在，rm 是无害的。
+    if systemctl cat Sing2-logrotate.timer >/dev/null 2>&1; then
+        systemctl disable --now Sing2-logrotate.timer >/dev/null 2>&1
+        rm -f /etc/systemd/system/Sing2-logrotate.timer /etc/systemd/system/Sing2-logrotate.service
+        systemctl daemon-reload
+    fi
 
     echo ""
     echo -e "${green}卸载成功${plain}"
@@ -375,13 +382,58 @@ show_status() {
         0)
             echo -e "Sing2 状态: ${green}已运行${plain}"
             show_enable_status
+            show_logrotate_status
             ;;
         1)
             echo -e "Sing2 状态: ${yellow}未运行${plain}"
             show_enable_status
+            show_logrotate_status
             ;;
         2) echo -e "Sing2 状态: ${red}未安装${plain}" ;;
     esac
+}
+
+# show_logrotate_status —— 「日志轮转到底有没有在跑」此前在任何界面上都看不到，
+# 于是想确认的人只能自己猜命令，而最顺手的那个（crontab -l）**在配置正确的系统上
+# 也必然为空**——logrotate 从不写用户 crontab。空 crontab 因此被读成「没配上」。
+# 这里给出唯一可信的三件事：配置在不在、谁触发、上次真的轮转是什么时候。
+show_logrotate_status() {
+    if [[ ! -f /etc/logrotate.d/Sing2 ]]; then
+        echo -e "日志轮转: ${red}未配置${plain}（重装或 ${green}sing2 update${plain} 会补上）"
+        return
+    fi
+
+    local driver=""
+    if systemctl is-active Sing2-logrotate.timer >/dev/null 2>&1; then
+        driver="Sing2-logrotate.timer（自建）"
+    elif systemctl is-active logrotate.timer >/dev/null 2>&1; then
+        driver="logrotate.timer"
+    elif [[ -x /etc/cron.daily/logrotate ]] &&
+         ! grep -q '/run/systemd/system' /etc/cron.daily/logrotate 2>/dev/null &&
+         { systemctl is-active crond >/dev/null 2>&1 || systemctl is-active cron >/dev/null 2>&1; }; then
+        driver="cron → /etc/cron.daily/logrotate"
+    fi
+
+    if [[ -z "$driver" ]]; then
+        echo -e "日志轮转: ${red}配置在，但没有任何东西会执行它${plain}——日志会一直涨"
+        echo -e "          修：${green}sing2 update${plain}（会重新挑驱动，必要时自建 timer）"
+        return
+    fi
+    echo -e "日志轮转: ${green}已配置${plain}，由 ${green}${driver}${plain} 触发"
+
+    # 上次轮转时间。状态文件路径按发行版不同，两处都看。没有记录说明还没轮转过
+    # ——刚装的机器就是这样，不是故障。
+    local state last
+    for state in /var/lib/logrotate/status /var/lib/logrotate.status; do
+        [[ -f "$state" ]] || continue
+        last=$(grep -F "${CONF_DIR}/access.log" "$state" 2>/dev/null | tail -1 | awk '{print $2}')
+        [[ -n "$last" ]] && break
+    done
+    if [[ -n "$last" ]]; then
+        echo -e "          access.log 上次轮转: ${green}${last}${plain}"
+    else
+        echo -e "          ${yellow}尚无轮转记录${plain}（刚安装时正常，首次触发后才会有）"
+    fi
 }
 
 show_enable_status() {

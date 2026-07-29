@@ -59,6 +59,7 @@ sing2 version      查看版本
 | `/etc/Sing2/error.log` | 运行日志（sing-box 侧） |
 | `/etc/Sing2/access.log` | 逐连接访问日志 |
 | `/etc/logrotate.d/Sing2` | 日志轮转配置 |
+| `/etc/systemd/system/Sing2-logrotate.timer` | 仅当系统本身没有轮转驱动时才自建（见「轮转」） |
 
 卸载**不会**删除 `/etc/Sing2`（里面有配置和证书）。要彻底清除自行 `rm -rf /etc/Sing2`。
 
@@ -120,8 +121,45 @@ tail -F /etc/Sing2/error.log    # sing-box 层
 写完会用 `logrotate -d` 自检语法——一份写坏的配置会让**系统上所有**轮转任务一起失败，不能只写
 不验。自检不过就删掉并打印原因。
 
-路径与出厂配置一一对应，都固定在 `/etc/Sing2/` 下。**改了 config.yml 里的日志路径，记得同步改**
-`/etc/logrotate.d/Sing2`。
+路径取自 `config.yml` 里**实际配置**的 `Log.AccessPath` / `Log.ErrorPath`，没配就用出厂路径
+（`/etc/Sing2/` 下）。改了日志路径之后跑一次 `sing2 update`，轮转配置会跟着更新——不跑的话
+它还盯着旧路径，而真正在涨的那个文件没人管。
+
+#### 它不在 crontab 里
+
+`crontab -l` 是空的**不代表没配**。logrotate 不是常驻进程，也不装用户 crontab，它由系统的
+调度器每天叫一次，两种之一：
+
+```bash
+systemctl status logrotate.timer     # 较新的发行版（Debian 11+ / Ubuntu 21.10+ / RHEL 9+）
+ls -l /etc/cron.daily/logrotate      # 较老的发行版，由 crond/cron 每天扫一次
+```
+
+安装脚本会挑出这台机器实际用的那条链路，**并在它装了却没启用时启用它**，然后在安装结束时
+点名是谁触发的。两条都不可用时（最小化镜像、容器、被加固脚本 mask 掉的机器）它不会报喜，
+而是自建一个只管这份配置的 `Sing2-logrotate.timer`——卸载时一并删除。
+
+> 有个反直觉的地方：Debian/Ubuntu 的 `/etc/cron.daily/logrotate` 开头就是「如果 systemd 是
+> init 就 `exit 0`」，把活交给 timer。所以在 timer 被 disable/mask 的机器上，这个文件**在，
+> 但故意什么都不做**。光看文件存不存在会得出错误结论，脚本因此要读一下它会不会让位。
+
+最省事的确认方式是 `sing2 status`，它会显示驱动和 `access.log` 上次轮转的时间。手动查：
+
+```bash
+grep Sing2 /var/lib/logrotate/status   # 记录每个日志上次轮转的日期
+ls /etc/Sing2/*.gz                     # 轮转产物
+```
+
+注意 `logrotate -d` 是**干跑**，不写状态文件。所以它对没见过的日志会打 `Creating new state`
+并把「上次轮转」记成当天零点，随后说「不到一天，不需要轮转」——这是干跑的正常输出，不代表
+今天已经轮转过。
+
+#### 找不到 `.gz`？先看日志有没有落盘
+
+`sing2 generate` 生成的配置默认把 `Log.AccessPath` 与 `Log.ErrorPath` **都注释掉**，日志全部
+进 journald，磁盘上根本没有这两个文件——轮转配置里的 `missingok` 让 logrotate 对此一声不吭。
+症状（`/etc/Sing2` 下找不到任何 `.gz`）和「轮转真的坏了」完全一样。安装时如果检测到这种情况
+会明确提示。要落盘就把这两行的注释去掉，路径改动后重跑 `sing2 update` 让轮转配置跟上。
 
 #### 为什么是 copytruncate
 
@@ -135,15 +173,42 @@ Sing2 全程持有日志文件描述符。logrotate 默认的 `create` 模式会
 #### 访问日志涨得快的节点
 
 系统的 logrotate 通常每天只跑一次（`cron.daily` 或 `logrotate.timer`），所以配置里的
-`maxsize 512M` 在默认节奏下不会让它在日内提前轮转。用户量大的节点可以让它跑得更勤：
+`maxsize 512M` 在默认节奏下不会让它在日内提前轮转。用户量大的节点可以让它跑得更勤。
+
+⚠ **改成日内多次之前，必须先改 `dateformat`**，否则从当天第二次起会静默失效：文件名带的是
+`dateext` + `dateformat -%Y%m%d`，日内第二次轮转的目标文件 `access.log-20260729.gz` 已经存在，
+logrotate 会打一句 `destination ... already exists, skipping rotation` 然后**跳过**。也就是说，
+恰恰在这条建议要解决的场景下（一天涨过两次 512M），它从第二次起就不干活了。
+
+把 `/etc/logrotate.d/Sing2` 里的这一行加上小时：
+
+```
+    dateformat -%Y%m%d%H
+```
+
+然后让它跑得更勤，二选一。用 systemd timer 的机器（`systemctl status logrotate.timer` 有输出）：
+
+```bash
+mkdir -p /etc/systemd/system/logrotate.timer.d
+printf '[Timer]\nOnCalendar=\nOnCalendar=hourly\n' > /etc/systemd/system/logrotate.timer.d/hourly.conf
+systemctl daemon-reload && systemctl restart logrotate.timer
+```
+
+（`OnCalendar=` 空行是必须的——它先清掉原有的每日设置，否则两条会叠加。这会让**系统上所有**
+轮转配置都改成每小时检查一次；其余配置基本都是 `daily`，检查再勤也一天只轮一次，是安全的。）
+
+用 cron 的机器：
 
 ```bash
 echo '0 * * * * root /usr/sbin/logrotate /etc/logrotate.d/Sing2' > /etc/cron.d/Sing2-logrotate
 ```
 
-改成每小时检查一次，超过 512M 就轮转，同时保持「每天至少一次」的下限。
+（这条要求 cron 装了且在跑；timer-only 的机器上写了也没人执行。）
 
-卸载 Sing2 时这份 logrotate 配置会一并删除。
+两种做法都是每小时检查一次，超过 512M 就轮转，同时保持「每天至少一次」的下限。
+
+卸载 Sing2 时这份 logrotate 配置会一并删除，自建的 `Sing2-logrotate.timer`（如果装过）也会
+一起停用并移除。手动加的 `/etc/cron.d/Sing2-logrotate` 或 timer override 不在此列，得自己清。
 
 ## 与 XrayR 的差异
 
