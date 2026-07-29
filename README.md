@@ -69,8 +69,12 @@ sing2 version      查看版本
 
 几个容易踩的点：
 
-- **`PanelType` 只能是 `SSpanel`。** 传统 SSpanel（< 2021.11）与 Phoenix 这类
-  custom_config 面板都属这一类，Sing2 按面板响应的形状自动分派，无需在配置里区分。
+- **`PanelType` 必须逐节点写对，取值只有 `SSpanel` 和 `Phoenix`。** 它是选择解析方言的
+  唯一依据：`SSpanel` 走传统 6 段式 `server` 串，`Phoenix` 走 `custom_config`。
+  **自 Sing2 v0.1.0 起不再按响应形状自动分派**——旧的嗅探行为会让解析路径在运行时变来
+  变去。写错不会静默降级：两个解析器互相拒收对方的载荷，节点直接起不来（报
+  `no server info in response` 或 `custom_config is empty`）并每 30s 重试。安装向导会问
+  你面板类型；手改配置时别漏了这一项。
 - **VMess 还是 VLESS 由面板决定。** `ApiConfig.EnableVless` 只是兜底；面板 server 串里的
   `enable_vless` 优先。因此同一份配置能同时服务 VMess-TCP / VMess-WS-TLS /
   VLESS-Vision-REALITY 三种节点。
