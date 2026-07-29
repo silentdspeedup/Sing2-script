@@ -7,7 +7,7 @@
 #   - 删除 DnsConfigPath / InboundConfigPath / OutboundConfigPath /
 #     RouteConfigPath 这些「指向 xray json 文件」的路径项；对应能力改为**直接内联**
 #     写在本文件里（DnsConfig / OutboundConfig / RouteConfig，见文件末尾）
-#   - PanelType 只支持 SSpanel（mod_mu 系，含传统 SSpanel 与 Phoenix 两代）
+#   - PanelType 区分 SSpanel（传统 server 串）与 Phoenix（custom_config），必须选对
 #   - 新增 AccessLog（访问日志上报）、ConnLimitConfig（并发连接数上限）
 #   - ConnectionConfig 字段与 XrayR 不同（xray policy 无对应），见文件末尾
 
@@ -47,7 +47,7 @@ AccessLog:
 
 Nodes:
   # ——— 节点 1：V2ray（VMess / VLESS，传统 SSpanel 或 Phoenix 均可）———
-  - PanelType: SSpanel # 唯一合法取值
+  - PanelType: SSpanel # SSpanel=传统 server 串 / Phoenix=custom_config，选错节点起不来
     ApiConfig:
       ApiHost: http://panel.example.com
       ApiKey: your-mu-key
@@ -62,7 +62,6 @@ Nodes:
       SpeedLimit: 0 # Mbps，本地设置会覆盖面板下发，0 = 不限
       DeviceLimit: 0 # 本地设置会覆盖面板下发，0 = 不限
       RuleListPath: # /etc/Sing2/rulelist
-      DisableCustomConfig: false # true 则强制走旧版 server 串解析
 
     ControllerConfig:
       ListenIP: 0.0.0.0

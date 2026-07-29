@@ -427,10 +427,17 @@ generate_config_file() {
         return 0
     fi
 
-    # 面板：Sing2 只支持 SSpanel（mod_mu 系）。传统 SSpanel 与 Phoenix 都属这一类，
-    # 节点端按面板响应的形状自动分派，无需在此区分。
-    echo -e "${yellow}面板类型：Sing2 仅支持 SSpanel（mod_mu 系，含传统版与 custom_config 版）${plain}"
-    PanelType="SSpanel"
+    # 面板类型决定节点载荷的解析方式，必须选对：SSpanel 恒按传统 6 段 server 串
+    # 解析，Phoenix 恒按 custom_config 解析。选错节点起不来（会明确报错并提示改哪个值）。
+    echo -e "${yellow}请选择对接的面板类型：${plain}"
+    echo -e "${green}1.${plain} SSpanel   传统 SSpanel（节点下发 6 段 server 串）"
+    echo -e "${green}2.${plain} Phoenix   Phoenix（节点下发 custom_config）"
+    read -rp "请选择 [1-2]（默认 1）：" panel_choice
+    case "${panel_choice}" in
+    2) PanelType="Phoenix" ;;
+    *) PanelType="SSpanel" ;;
+    esac
+    echo -e "${green}面板类型：${PanelType}${plain}"
 
     read -rp "请输入面板地址（如 https://panel.example.com）：" ApiHost
     read -rp "请输入面板对接 API Key：" ApiKey
@@ -548,7 +555,6 @@ EOF
       SpeedLimit: 0 # Mbps，0 = 不限（本地设置会覆盖面板下发）
       DeviceLimit: 0 # 0 = 不限
       RuleListPath: # ${CONF_DIR}/rulelist
-      DisableCustomConfig: false # true = 强制走旧版 server 串解析
     ControllerConfig:
       ListenIP: 0.0.0.0
       SendIP: 0.0.0.0
