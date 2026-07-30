@@ -36,7 +36,10 @@ sing2 restart      重启
 sing2 status       查看状态
 sing2 enable       设置开机自启
 sing2 disable      取消开机自启
-sing2 log          查看日志（journalctl -f）
+sing2 log          合并查看全部运行日志（等同于 sing2 log all）
+sing2 log runtime  只看 Sing2/panel 和核心运行信息，排除逐连接错误
+sing2 log access   只看用户连接记录
+sing2 log failures 只看连接失败、DNS 错误和超时
 sing2 config       编辑配置文件
 sing2 generate     生成配置文件（向导）
 sing2 x25519       生成 REALITY 密钥对
@@ -103,15 +106,27 @@ sing2 version      查看版本
 | `/etc/Sing2/access.log` | 逐连接访问日志，XrayR 行格式 |
 
 ⚠ **配了 `ErrorPath` 之后日志就分成两半**：sing-box 侧全部写进那个文件、不再进 journald，
-而 Sing2 自己的 `[panel]` 行走 stdout、仍在 journald。`sing2 log` 已经会**同时跟随两边**，
-所以照常用它即可；手动看的话两条都要：
+而 Sing2 自己的 `[panel]` 行走 stdout、仍在 journald。日志命令会根据视图同时处理两边：
+
+| 命令 | 内容 |
+|---|---|
+| `sing2 log` / `sing2 log all` | 原有兼容视图：panel/journald 与完整 `error.log` |
+| `sing2 log runtime` | Sing2/panel 与核心运行信息，排除带 `connection:` 的逐连接错误 |
+| `sing2 log access` | 只跟随 `Log.AccessPath`，用于查看用户、入站、目标地址等连接记录 |
+| `sing2 log failures` | 只保留带 `connection:` 的失败记录，例如 DNS、连接超时和拒绝 |
+
+四种视图都会先显示最近记录（每个日志源最多 50 条），再实时跟随；`tail -F` 兼容 logrotate 的
+`copytruncate`，轮转后无需重新运行命令。没有配置对应路径或日志尚未生成时，脚本会明确提示。
+
+手动查看原始日志仍可使用：
 
 ```bash
 journalctl -u Sing2 -f          # [panel] 层
-tail -F /etc/Sing2/error.log    # sing-box 层
+tail -F /etc/Sing2/error.log    # sing-box 运行与连接失败
+tail -F /etc/Sing2/access.log   # 用户连接记录
 ```
 
-不想要这种切分就把 `ErrorPath` 留空，全部回到 journald。
+不想让运行日志分流，就把 `ErrorPath` 留空，sing-box 运行日志会回到 journald。
 
 ### 轮转
 

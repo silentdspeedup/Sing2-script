@@ -234,43 +234,158 @@ config_log_path() {
     echo "$val"
 }
 
+show_log_usage() {
+    echo "日志查看用法："
+    echo "  sing2 log all       合并查看 panel/journald 与完整运行日志（默认）"
+    echo "  sing2 log runtime   只看 Sing2/panel 和核心运行信息，排除逐连接错误"
+    echo "  sing2 log access    只看用户连接记录（Log.AccessPath）"
+    echo "  sing2 log failures  只看连接失败、DNS 错误和超时（Log.ErrorPath）"
+}
+
+# connection: 是 sing-box 逐连接错误的稳定标记。runtime 排除它，failures 只保留它。
+show_recent_journal() {
+    local mode=$1
+    case "$mode" in
+        all)      journalctl -u ${SERVICE}.service -n 50 --no-pager ;;
+        runtime)  journalctl -u ${SERVICE}.service -n 2000 --no-pager |
+                  grep -vE '(^|[[:space:]])connection:' | tail -n 50 ;;
+        failures) journalctl -u ${SERVICE}.service -n 2000 --no-pager |
+                  grep -E '(^|[[:space:]])connection:' | tail -n 50 ;;
+    esac
+}
+
+show_recent_log_file() {
+    local logfile=$1 mode=$2
+    case "$mode" in
+        all|access) tail -n 50 "$logfile" ;;
+        runtime)    tail -n 2000 "$logfile" |
+                    grep -vE '(^|[[:space:]])connection:' | tail -n 50 ;;
+        failures)   tail -n 2000 "$logfile" |
+                    grep -E '(^|[[:space:]])connection:' | tail -n 50 ;;
+    esac
+}
+
+follow_journal() {
+    local mode=$1
+    case "$mode" in
+        all)      journalctl -u ${SERVICE}.service -f --no-pager ;;
+        runtime)  journalctl -u ${SERVICE}.service -f --no-pager |
+                  grep --line-buffered -vE '(^|[[:space:]])connection:' ;;
+        failures) journalctl -u ${SERVICE}.service -f --no-pager |
+                  grep --line-buffered -E '(^|[[:space:]])connection:' ;;
+    esac
+}
+
+follow_log_file() {
+    local logfile=$1 mode=$2
+    # -F 会在 logrotate 后重新打开文件；文件暂未生成时也会持续等待。
+    case "$mode" in
+        all|access) tail -n 0 -F "$logfile" ;;
+        runtime)    tail -n 0 -F "$logfile" |
+                    grep --line-buffered -vE '(^|[[:space:]])connection:' ;;
+        failures)   tail -n 0 -F "$logfile" |
+                    grep --line-buffered -E '(^|[[:space:]])connection:' ;;
+    esac
+}
+
 show_log() {
+    local return_to_menu=0 mode="${1:-all}"
+    [[ $# == 0 ]] && return_to_menu=1
+
+    case "$mode" in
+        all|runtime|access|failures) ;;
+        *)
+            echo -e "${red}未知日志视图：${mode}${plain}"
+            show_log_usage
+            [[ $return_to_menu == 1 ]] && before_show_menu
+            return 2
+            ;;
+    esac
+
     check_status
     if [[ $? == 2 ]]; then
         diagnose_missing_unit
-        [[ $# == 0 ]] && before_show_menu
+        [[ $return_to_menu == 1 ]] && before_show_menu
         return 1
     fi
 
-    # 配了 Log.ErrorPath 之后日志就**分成两半**：sing-box 侧全部写进那个文件、
-    # 不再进 journald，而 Sing2 自己的 [panel] 行走 stdout、仍在 journald。
-    # 只看其中一半会漏掉另一半，所以两边一起跟。
-    local errlog
+    local errlog accesslog follower_pid
     errlog=$(config_log_path "ErrorPath") || errlog=""
+    accesslog=$(config_log_path "AccessPath") || accesslog=""
 
-    journalctl -u ${SERVICE}.service -n 50 --no-pager
+    if [[ "$mode" == "access" ]]; then
+        if [[ -z "$accesslog" ]]; then
+            echo -e "${yellow}配置中没有启用 Log.AccessPath，当前没有独立的用户连接日志。${plain}"
+            echo "请在 ${CONF} 的 Log 段设置 AccessPath 后重启 Sing2。"
+            [[ $return_to_menu == 1 ]] && before_show_menu
+            return 1
+        fi
+
+        echo -e "${yellow}--- 用户连接日志：${accesslog}（最近 50 行） ---${plain}"
+        if [[ -f "$accesslog" ]]; then
+            show_recent_log_file "$accesslog" access
+        else
+            echo -e "${yellow}日志文件尚未生成；将等待第一条连接记录。${plain}"
+        fi
+        echo -e "${yellow}--- 以下为实时用户连接记录，Ctrl-C 退出 ---${plain}"
+        follow_log_file "$accesslog" access
+        [[ $return_to_menu == 1 ]] && before_show_menu
+        return
+    fi
+
+    if [[ "$mode" == "failures" ]]; then
+        echo -e "${yellow}--- 用户连接失败（最近 50 条）---${plain}"
+        if [[ -n "$errlog" ]]; then
+            if [[ -f "$errlog" ]]; then
+                show_recent_log_file "$errlog" failures
+            else
+                echo -e "${yellow}配置指向 ${errlog}，但文件尚未生成；将等待第一条错误。${plain}"
+            fi
+            echo -e "${yellow}--- 以下为实时连接失败，Ctrl-C 退出 ---${plain}"
+            follow_log_file "$errlog" failures
+        else
+            show_recent_journal failures
+            echo -e "${yellow}--- 以下为实时连接失败，Ctrl-C 退出 ---${plain}"
+            follow_journal failures
+        fi
+        [[ $return_to_menu == 1 ]] && before_show_menu
+        return
+    fi
+
+    if [[ "$mode" == "runtime" ]]; then
+        echo -e "${yellow}--- Sing2/panel 运行信息（最近 50 条）---${plain}"
+    else
+        echo -e "${yellow}--- Sing2/panel 日志（最近 50 行）---${plain}"
+    fi
+    show_recent_journal "$mode"
+
     if [[ -n "$errlog" && -f "$errlog" ]]; then
         echo
-        echo -e "${yellow}--- ${errlog} 最近 50 行 ---${plain}"
-        tail -n 50 "$errlog"
+        echo -e "${yellow}--- ${errlog}（最近 50 条）---${plain}"
+        show_recent_log_file "$errlog" "$mode"
     elif [[ -n "$errlog" ]]; then
         echo -e "${yellow}提示：配置指向 ${errlog}，但该文件尚不存在（还没产生日志）${plain}"
     fi
 
-    echo -e "${yellow}--- 以下为实时日志，Ctrl-C 退出 ---${plain}"
-    if [[ -n "$errlog" && -f "$errlog" ]]; then
-        # -F 而不是 -f：logrotate 用的是 copytruncate，文件会被就地截断，
-        # -F 会跟着重新打开，-f 则会一直读一个已经变空的 fd。
-        tail -n 0 -F "$errlog" &
-        local tailpid=$!
-        trap 'kill "$tailpid" 2>/dev/null' EXIT INT TERM
-        journalctl -u ${SERVICE}.service -f --no-pager
-        kill "$tailpid" 2>/dev/null
+    if [[ "$mode" == "runtime" ]]; then
+        echo -e "${yellow}--- 以下为实时运行信息（已排除逐连接错误），Ctrl-C 退出 ---${plain}"
+    else
+        echo -e "${yellow}--- 以下为全部实时运行日志，Ctrl-C 退出 ---${plain}"
+    fi
+
+    # ErrorPath 非空时，sing-box 与 panel 日志分属文件和 journald，需同时跟随。
+    if [[ -n "$errlog" ]]; then
+        follow_log_file "$errlog" "$mode" &
+        follower_pid=$!
+        trap 'kill "$follower_pid" 2>/dev/null; wait "$follower_pid" 2>/dev/null' EXIT INT TERM
+        follow_journal "$mode"
+        kill "$follower_pid" 2>/dev/null
+        wait "$follower_pid" 2>/dev/null
         trap - EXIT INT TERM
     else
-        journalctl -u ${SERVICE}.service -f --no-pager
+        follow_journal "$mode"
     fi
-    [[ $# == 0 ]] && before_show_menu
+    [[ $return_to_menu == 1 ]] && before_show_menu
 }
 
 install_bbr() {
@@ -698,7 +813,10 @@ show_usage() {
     echo "sing2 status       - 查看状态"
     echo "sing2 enable       - 设置开机自启"
     echo "sing2 disable      - 取消开机自启"
-    echo "sing2 log          - 查看日志"
+    echo "sing2 log [all]    - 合并查看全部运行日志（默认）"
+    echo "sing2 log runtime  - 只看运行状态，排除逐连接错误"
+    echo "sing2 log access   - 只看用户连接记录"
+    echo "sing2 log failures - 只看连接失败、DNS 错误和超时"
     echo "sing2 config       - 编辑配置文件"
     echo "sing2 generate     - 生成配置文件（向导）"
     echo "sing2 x25519       - 生成 REALITY 密钥对"
@@ -770,7 +888,7 @@ if [[ $# -gt 0 ]]; then
         "status")    check_install 0 && status 0 ;;
         "enable")    check_install 0 && enable 0 ;;
         "disable")   check_install 0 && disable 0 ;;
-        "log")       check_install 0 && show_log 0 ;;
+        "log")       check_install 0 && show_log "${2:-all}" 0 ;;
         "update")    check_install 0 && update 0 "${@:2}" ;;
         "config")    config "$@" ;;
         "generate")  generate_config_file 0 ;;

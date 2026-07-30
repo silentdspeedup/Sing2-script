@@ -17,8 +17,9 @@ Log:
   # 改路径的话记得同步改 /etc/logrotate.d/Sing2。
   #
   # ⚠ 填了路径之后，**sing-box 侧**的日志只进这个文件、不再进 journald，
-  #   `sing2 log` 那边只剩 [panel] 开头的行。要看完整运行日志用：
-  #     tail -f /etc/Sing2/error.log
+  #   Sing2 自己的 [panel] 行仍在 journald。管理脚本会处理这个分流：
+  #     sing2 log runtime   # 运行信息，排除逐连接错误
+  #     sing2 log failures  # 只看逐连接失败
   #   留空则回到全部走 journald 的老行为。
   ErrorPath: /etc/Sing2/error.log
   # 逐连接访问日志（XrayR 格式）：
