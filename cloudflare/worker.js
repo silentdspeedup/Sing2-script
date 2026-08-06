@@ -49,8 +49,13 @@ export default {
 };
 
 function authorized(request, env) {
+  // 头部值由 HTTP 层保证不带首尾空白；secret 侧则**必须** trim ——在控制台粘贴
+  // 密钥时很容易带进一个尾换行，那会让长度从 64 变成 65、下面的长度比较直接不等，
+  // 于是一切请求都返回 404。而 secret 的值不回显，这个错在控制台里完全看不出来，
+  // 排查时的表现和"密钥打错了"一模一样。
   const got = request.headers.get("x-sing2-key") || "";
-  for (const expected of [env.DIST_KEY, env.DIST_KEY_NEXT]) {
+  for (const raw of [env.DIST_KEY, env.DIST_KEY_NEXT]) {
+    const expected = (raw || "").trim();
     if (!expected) continue;
     // timingSafeEqual 对长度不等会抛异常，所以先比长度。密钥长度是固定且公开的
     // （openssl rand -hex 32 → 64 字符），泄露它不构成信息增益。
