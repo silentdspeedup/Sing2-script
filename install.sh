@@ -150,10 +150,87 @@ save_dist_key() {
     return 0
 }
 
+have_downloader() {
+    command -v curl >/dev/null 2>&1 || command -v wget >/dev/null 2>&1
+}
+
+# 拿 latest 当试金石验证密钥：它是桶里最小的对象，而端点对「密钥错」与「路径不
+# 存在」返回同一个 404，所以「取得到」就等价于「密钥对」。
+verify_dist_key() {
+    local vtmp rc=1
+    vtmp=$(mktemp) || return 1
+    fetch "${DIST_BASE}/latest" "$vtmp" && rc=0
+    rm -f "$vtmp"
+    return $rc
+}
+
+# 交互式读入密钥。
+#
+# 为什么要单独找 /dev/tty 而不是直接 read：一键安装的推荐形式是
+# `bash <(curl -Ls ...)`，那种形式下 stdin 仍是终端，直接 read 就行；但总会有人
+# 写成 `curl -Ls ... | bash`，那时 stdin 是**脚本自己的字节流**，read 会把脚本的
+# 下一行当成密钥吃掉——表现为提示一闪而过、然后拿着一行 shell 代码去当密钥。
+# 从 /dev/tty 读则两种形式都正确。
+#
+# 非交互环境（无 tty，比如 CI 或 cron）**不提示**，直接返回 1 让调用方打印错误并
+# 退出。在那种地方卡在 read 上会变成一个静默挂起，比一条错误难查得多。
+prompt_dist_key() {
+    local tty=/dev/tty
+    [[ -r "$tty" && -w "$tty" ]] || tty=""
+    [[ -n "$tty" || -t 0 ]] || return 1
+
+    echo -e "${yellow}二进制托管在需要鉴权的分发端点上，需要分发密钥。${plain}"
+    echo -e "输入一次即可——验证通过后会写入 ${green}${DIST_KEY_FILE}${plain}（600），"
+    echo -e "此后 ${green}sing2 update${plain} 自动读取，不再需要输入。"
+
+    local attempt key
+    for attempt in 1 2 3; do
+        if [[ -n "$tty" ]]; then
+            printf '请输入分发密钥（不回显）: ' > "$tty"
+            IFS= read -rs key < "$tty"
+            printf '\n' > "$tty"
+        else
+            printf '请输入分发密钥（不回显）: '
+            IFS= read -rs key
+            printf '\n'
+        fi
+        # IFS= 关掉了 read 自带的首尾裁剪，这里显式裁——粘贴带进空格或回车太常见了。
+        key=$(printf '%s' "$key" | tr -d ' \t\r\n')
+
+        if [[ -z "$key" ]]; then
+            echo -e "${yellow}没有读到任何内容${plain}（第 ${attempt}/3 次）"
+            continue
+        fi
+
+        DIST_KEY="$key"
+
+        # install_base 之前 curl/wget 可能都还没装，那就没法验证。此时先收下，
+        # 让后面正常的下载路径去暴露问题——总比在这里报一个「密钥无效」要好，
+        # 那会把「没有下载工具」误诊成「密钥错了」。
+        if ! have_downloader; then
+            save_dist_key && echo -e "${green}已保存${plain}（尚未验证：本机还没有 curl/wget）"
+            return 0
+        fi
+
+        if verify_dist_key; then
+            echo -e "${green}密钥有效${plain}"
+            save_dist_key ||
+                echo -e "${yellow}写入 ${DIST_KEY_FILE} 失败${plain}，下次更新需要重新输入"
+            return 0
+        fi
+
+        DIST_KEY=""
+        echo -e "${red}密钥无效或端点不可达${plain}（第 ${attempt}/3 次）"
+        echo -e "  端点对「密钥错误」与「路径不存在」返回同一个 404，无法从响应上区分。"
+    done
+    return 1
+}
+
 # 在**发请求之前**拦住，而不是让请求打到 Worker 拿一个语焉不详的 404
 # （无密钥、错密钥、路径不存在在那边是同一个响应，见 cloudflare/worker.js）。
 require_dist_key() {
     [[ -n "$DIST_KEY" ]] && return 0
+    prompt_dist_key && return 0
     echo -e "${red}缺少分发密钥${plain}——二进制托管在需要鉴权的分发端点上。"
     echo -e "  本次带上：${green}DIST_KEY=你的密钥 bash install.sh${plain}"
     echo -e "  或写入后长期生效：${green}sing2 key${plain}"
@@ -635,7 +712,16 @@ install_Sing2() {
     mkdir -p "${INSTALL_DIR}" "${CONF_DIR}"
     # 密钥落盘，供后续 `sing2 update` 免输使用。放在这里而不是更早：只有确实下载
     # 成功过，才说明这把密钥是对的，值得存。
-    save_dist_key || echo -e "${yellow}分发密钥写入 ${DIST_KEY_FILE} 失败${plain}，下次更新需要重新提供"
+    # 交互式输入那条路已经在验证通过时存过了，这里只覆盖 DIST_KEY= 环境变量／
+    # --dist-key 参数那条路；已经存在就不再重复报喜。
+    local key_was_stored=0
+    [[ -s "$DIST_KEY_FILE" ]] && key_was_stored=1
+    if save_dist_key; then
+        [[ $key_was_stored == 1 ]] ||
+            echo -e "分发密钥已保存到 ${green}${DIST_KEY_FILE}${plain}（600），后续 ${green}sing2 update${plain} 不再需要提供"
+    else
+        echo -e "${yellow}分发密钥写入 ${DIST_KEY_FILE} 失败${plain}，下次更新需要重新提供"
+    fi
     install -m 755 "${tmp}/unpacked/sing2" "${INSTALL_DIR}/sing2"
 
     install_unit "${tmp}/unpacked/Sing2.service"
@@ -720,6 +806,11 @@ done
 # 环境变量/命令行没给就读落盘文件。要在 install_Sing2 之前，fetch() 靠 $DIST_KEY
 # 决定是否给分发端点带认证头。
 load_dist_key
+
+# 密钥的索取放在 install_base **之前**：装包要好几分钟，让人等完再被问密钥、
+# 输错了又得从头来，是最难受的顺序。已有密钥（环境变量或落盘文件）时这里是空操作，
+# 所以 `sing2 update` 不会因此多出一次提问。
+require_dist_key
 
 echo -e "${green}开始安装 Sing2${plain}"
 install_base
