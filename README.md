@@ -12,19 +12,26 @@ SSpanel（mod_mu 系，传统版与 custom_config 版都支持），协议由 si
 ## 一键安装
 
 **本脚本是公开的，二进制不是。** 脚本层（`install.sh`、`Sing2.sh`、`Sing2.service`）无需
-任何凭据即可获取；Sing2 二进制托管在需要密钥的分发端点上，首次安装用 `DIST_KEY=` 传入
-（见「[分发密钥](#分发密钥)」）：
+任何凭据即可获取；Sing2 二进制托管在需要密钥的分发端点上。
+
+```bash
+bash <(curl -Ls https://raw.githubusercontent.com/silentdspeedup/Sing2-script/master/install.sh)
+```
+
+**没有密钥时脚本会当场提示你输入**（不回显），就在装包之前——不用事先准备什么。输入会立即
+拿去验证，错了可以重来（共 3 次）。验证通过后以 600 权限落到 `/etc/Sing2/dist_key`，此后
+`sing2 update` 自动读取，**不必再输**。
+
+要免交互（批量部署、脚本化）就用环境变量或参数：
 
 ```bash
 DIST_KEY=你的密钥 bash <(curl -Ls https://raw.githubusercontent.com/silentdspeedup/Sing2-script/master/install.sh)
 ```
 
-密钥会以 600 权限落到 `/etc/Sing2/dist_key`，之后 `sing2 update` 自动读取，不必再输。
-
 安装指定版本（`v` 前缀可省）：
 
 ```bash
-DIST_KEY=你的密钥 bash <(curl -Ls https://raw.githubusercontent.com/silentdspeedup/Sing2-script/master/install.sh) v1.0.0
+bash <(curl -Ls https://raw.githubusercontent.com/silentdspeedup/Sing2-script/master/install.sh) v1.0.0
 ```
 
 已装同一版本时安装脚本会直接报"无需更新"并退出（退出码 10），只刷新管理脚本，
@@ -44,12 +51,18 @@ DIST_KEY=你的密钥 bash <(curl -Ls https://raw.githubusercontent.com/silentds
 
 | 场景 | 做法 |
 |---|---|
-| 首次安装 | `DIST_KEY=… bash <(curl -Ls …/install.sh)` |
+| 首次安装 / 升级时没有密钥 | **什么都不用做**，脚本会提示输入 |
+| 免交互（批量部署） | `DIST_KEY=… bash <(…)` 或 `--dist-key 密钥` |
 | 已装节点写入/轮换 | `sing2 key`（输入不回显，不进 shell history） |
 | 手工写入 | `printf '%s' '密钥' > /etc/Sing2/dist_key && chmod 600 /etc/Sing2/dist_key` |
 
-没有密钥时 `sing2 update` 会在**下载之前**停下并提示，不会动到现有安装。密钥错误与
-版本不存在在端点侧返回的是同一个 404，无法从响应上区分——报错信息里也这么写了。
+提示排在装包**之前**——装包要几分钟，等完再被问密钥、输错了又从头来是最难受的顺序。
+
+**非交互环境（CI、cron、`systemd` 里）不会提示**，直接报错退出。那种地方卡在等待输入上
+是静默挂起，比一条错误难查得多。
+
+密钥错误与版本不存在在端点侧返回的是同一个 404，无法从响应上区分——所以脚本的报错信息里
+把这两种可能都列出来了。
 
 网关实现见 [`cloudflare/worker.js`](cloudflare/worker.js)。
 
