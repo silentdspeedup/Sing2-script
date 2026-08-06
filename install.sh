@@ -48,6 +48,28 @@ cur_dir=$(pwd)
 
 [[ $EUID -ne 0 ]] && echo -e "${red}错误：${plain} 必须以 root 运行此脚本\n" && exit 1
 
+# ---------- 临时目录清理 ----------
+# 原先是 install_Sing2 内部 `local tmp` + `trap 'rm -rf "$tmp"' EXIT`。EXIT trap
+# 在函数**返回之后**才触发，那时 local 已经销毁，trap 里的 $tmp 取的是全局作用域
+# 的值。本脚本没有同名全局变量，所以实际表现只是临时目录泄漏；但只要外部环境
+# 带进来一个 tmp=/某路径（脚本以 root 跑，且常以 `bash <(curl ...)` 方式继承调用
+# 者的环境），这条 trap 就会递归删掉那个路径。doc/08 R22(a)。
+#
+# 改法两条：变量提到全局（trap 触发时确实还在），清理走带校验的函数——只删
+# mktemp 建出来的那一个，且必须落在系统临时目录下面。
+tmp=""
+cleanup_tmp() {
+    [[ -n "$tmp" && -d "$tmp" ]] || return 0
+    local base=${TMPDIR:-/tmp}
+    base=${base%/}   # TMPDIR 带尾斜杠时 "$base"/* 会匹配不上
+    case "$tmp" in
+        "$base"/*|/tmp/*|/var/tmp/*) rm -rf -- "$tmp" ;;
+        *) echo -e "${yellow}临时目录路径不在预期范围内，未删除：${tmp}${plain}" ;;
+    esac
+    tmp=""
+}
+trap cleanup_tmp EXIT
+
 # ---------- 系统识别 ----------
 if [[ -f /etc/redhat-release ]]; then
     release="centos"
@@ -559,9 +581,9 @@ install_Sing2() {
 
     # 下载到临时目录再落盘：直接删 INSTALL_DIR 会在下载失败时把一个能跑的节点
     # 变成一个删干净的节点。
-    local tmp
+    # tmp **刻意不声明成 local**，清理由文件头的 cleanup_tmp/EXIT trap 负责——
+    # 声明成 local 正是 doc/08 R22(a) 那个问题。
     tmp=$(mktemp -d) || { echo -e "${red}无法创建临时目录${plain}"; exit 1; }
-    trap 'rm -rf "$tmp"' EXIT
 
     echo -e "下载：${url}"
     if ! fetch "${url}" "${tmp}/Sing2.zip"; then

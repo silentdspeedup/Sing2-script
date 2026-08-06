@@ -104,8 +104,10 @@ sing2 version      查看版本
 
 几个容易踩的点：
 
-- **`PanelType` 必须逐节点写对，取值只有 `SSpanel` 和 `Phoenix`。** 它是选择解析方言的
-  唯一依据：`SSpanel` 走传统 6 段式 `server` 串，`Phoenix` 走 `custom_config`。
+- **`PanelType` 必须逐节点写对，取值只有 `SSpanel` 和 `Rigel`。** 它是选择解析方言的
+  唯一依据：`SSpanel` 走传统 6 段式 `server` 串，`Rigel` 走 `custom_config`。
+  面板改名前 `Rigel` 叫 `Phoenix`，**旧写法仍然受理**（折叠到 `Rigel`，只告警一次），
+  所以存量节点不必赶在面板改名的同一个维护窗口里改配置；新写的配置用 `Rigel`。
   **自 Sing2 v0.1.0 起不再按响应形状自动分派**——旧的嗅探行为会让解析路径在运行时变来
   变去。写错不会静默降级：两个解析器互相拒收对方的载荷，节点直接起不来（报
   `no server info in response` 或 `custom_config is empty`）并每 30s 重试。安装向导会问

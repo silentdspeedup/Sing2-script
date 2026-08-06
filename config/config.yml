@@ -7,7 +7,8 @@
 #   - 删除 DnsConfigPath / InboundConfigPath / OutboundConfigPath /
 #     RouteConfigPath 这些「指向 xray json 文件」的路径项；对应能力改为**直接内联**
 #     写在本文件里（DnsConfig / OutboundConfig / RouteConfig，见文件末尾）
-#   - PanelType 区分 SSpanel（传统 server 串）与 Phoenix（custom_config），必须选对
+#   - PanelType 区分 SSpanel（传统 server 串）与 Rigel（custom_config），必须选对
+#     （Rigel 旧称 Phoenix，旧写法仍受理，只告警一次）
 #   - 新增 AccessLog（访问日志上报）、ConnLimitConfig（并发连接数上限）
 #   - ConnectionConfig 字段与 XrayR 不同（xray policy 无对应），见文件末尾
 
@@ -47,8 +48,8 @@ AccessLog:
   IngestChanSize: 100000 # 热路径投递通道容量，满即丢弃、绝不阻塞转发
 
 Nodes:
-  # ——— 节点 1：V2ray（VMess / VLESS，传统 SSpanel 或 Phoenix 均可）———
-  - PanelType: SSpanel # SSpanel=传统 server 串 / Phoenix=custom_config，选错节点起不来
+  # ——— 节点 1：V2ray（VMess / VLESS，传统 SSpanel 或 Rigel 均可）———
+  - PanelType: SSpanel # SSpanel=传统 server 串 / Rigel=custom_config，选错节点起不来
     ApiConfig:
       ApiHost: http://panel.example.com
       ApiKey: your-mu-key
@@ -116,7 +117,7 @@ Nodes:
         LimitDuration: 0 # 分钟
 
       # 跨节点在线设备数限制：不在这里配置。
-      # SSpanel 系（传统 SSpanel / Phoenix 都是）自带这条通路——各节点上报在线 IP，
+      # SSpanel 系（传统 SSpanel / Rigel 都是）自带这条通路——各节点上报在线 IP，
       # 面板汇总出全网 alive_ip 再随用户列表下发，节点按
       # node_iplimit − alive_ip + 本节点上次上报数 算出本节点还能给几个设备。
       # 每用户上限在面板的 node_iplimit 里设；想在节点侧统一压低用 ApiConfig.DeviceLimit。
