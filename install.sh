@@ -2,16 +2,16 @@
 # SPDX-License-Identifier: GPL-3.0-or-later
 #
 # Sing2 一键安装脚本
-#   DIST_KEY=xxx bash <(curl -Ls https://raw.githubusercontent.com/silentdspeedup/Sing2-script/master/install.sh)
+#   bash <(curl -Ls https://raw.githubusercontent.com/silentdspeedup/Sing2-script/master/install.sh)
 #   bash <(curl -Ls .../install.sh) v1.2.3     # 安装指定版本
 #
-# 本脚本本身是公开的，无需凭据即可获取；**二进制**托管在需要密钥的分发端点上
-# （见下方「分发端点」一节）。首次安装用 DIST_KEY= 传入，之后落盘到
-# /etc/Sing2/dist_key，`sing2 update` 自动读取。
+# 二进制不在本仓库里，需要分发端点地址与密钥。没有的话脚本会提示输入，验证通过后
+# 落盘，之后 `sing2 update` 自动读取。免交互可用 DIST_BASE= / DIST_KEY= 环境变量。
 #
-# 布局（与 Sing2.service / Sing2.sh 一致）：
+# 布局：
 #   /usr/local/Sing2/sing2        二进制
 #   /etc/Sing2/config.yml         配置（升级不覆盖）
+#   /etc/Sing2/dist_base          分发端点（600）
 #   /etc/Sing2/dist_key           分发密钥（600）
 #   /usr/bin/sing2                管理脚本（sing2 / Sing2 大小写均可）
 
@@ -22,27 +22,14 @@ green='\033[0;32m'
 yellow='\033[0;33m'
 plain='\033[0m'
 
-# Sing2 本体仓库已转为私有，本脚本不再引用它——二进制走下面的分发端点，
-# 脚本层走公开的 SCRIPT_REPO。
 SCRIPT_REPO="silentdspeedup/Sing2-script"
 INSTALL_DIR="/usr/local/Sing2"
 CONF_DIR="/etc/Sing2"
 
-# ---------- 分发端点 ----------
-# 二进制不再从 GitHub Release 取：Sing2 仓库已转为私有，那条路匿名一律 404。
-# 现在走 Cloudflare R2，前面挡一层 Worker 做密钥校验（方案见 Sing2 仓库 doc/16）。
-#
-# 注意这里的**不对称**：本脚本所在的 Sing2-script 仓库仍是公开的，所以脚本层
-# （install.sh / Sing2.sh / Sing2.service）继续走 raw.githubusercontent.com，
-# 不需要任何凭据 —— 只有下载二进制才需要密钥。一键安装的入口命令因此一个字都没变，
-# 存量节点也能靠公开的脚本层自己升级上来。
-#
-# 日后要改自有域名，只改这一行。**结尾不要带斜杠** —— fetch() 用
-# `"$url" == "${DIST_BASE}/"*` 判断该不该附加认证头，多一个斜杠会让所有下载都
-# 匹配不上，于是不带密钥发出去、拿一个 404，而且报错信息完全看不出是这个原因。
-DIST_BASE="${DIST_BASE:-https://sing2-dist.mysecuritysys.workers.dev}"
-DIST_KEY_FILE="${CONF_DIR}/dist_key"
+DIST_BASE="${DIST_BASE:-}"
 DIST_KEY="${DIST_KEY:-}"
+DIST_BASE_FILE="${CONF_DIR}/dist_base"
+DIST_KEY_FILE="${CONF_DIR}/dist_key"
 
 cur_dir=$(pwd)
 
@@ -53,7 +40,7 @@ cur_dir=$(pwd)
 # 在函数**返回之后**才触发，那时 local 已经销毁，trap 里的 $tmp 取的是全局作用域
 # 的值。本脚本没有同名全局变量，所以实际表现只是临时目录泄漏；但只要外部环境
 # 带进来一个 tmp=/某路径（脚本以 root 跑，且常以 `bash <(curl ...)` 方式继承调用
-# 者的环境），这条 trap 就会递归删掉那个路径。doc/08 R22(a)。
+# 者的环境），这条 trap 就会递归删掉那个路径。
 #
 # 改法两条：变量提到全局（trap 触发时确实还在），清理走带校验的函数——只删
 # mktemp 建出来的那一个，且必须落在系统临时目录下面。
@@ -103,7 +90,7 @@ case "${release}" in
 esac
 
 # ---------- 架构识别 ----------
-# 取值必须与发布产物名一致（Sing2 .github/build/friendly-filenames.json）。
+# 取值必须与发布产物的文件名一致。
 detect_arch() {
     case "$(uname -m)" in
         x86_64 | x64 | amd64)   echo "linux-64" ;;
@@ -127,26 +114,47 @@ if [[ -z "$arch" ]]; then
 fi
 echo -e "架构：${green}${arch}${plain}"
 
-# ---------- 分发密钥 ----------
-# 优先级：环境变量/命令行 > 落盘文件。只有下载二进制用得上它。
-load_dist_key() {
-    [[ -n "$DIST_KEY" ]] && return 0
-    [[ -r "$DIST_KEY_FILE" ]] || return 0
-    DIST_KEY=$(tr -d ' \t\r\n' < "$DIST_KEY_FILE")
+# ---------- 分发端点与密钥 ----------
+# 优先级：环境变量/命令行 > 落盘文件 > 交互式提示。
+
+load_dist_config() {
+    [[ -z "$DIST_BASE" && -r "$DIST_BASE_FILE" ]] &&
+        DIST_BASE=$(tr -d ' \t\r\n' < "$DIST_BASE_FILE")
+    [[ -z "$DIST_KEY" && -r "$DIST_KEY_FILE" ]] &&
+        DIST_KEY=$(tr -d ' \t\r\n' < "$DIST_KEY_FILE")
     return 0
 }
 
+# 结尾的斜杠必须去掉：fetch() 用 `"$url" == "${DIST_BASE}/"*` 判断该不该附加认证
+# 头，多一个斜杠会让所有下载都匹配不上，于是不带密钥发出去、拿一个 404，而报错
+# 信息完全看不出是这个原因。省略协议时补 https。
+normalize_dist_base() {
+    local v
+    v=$(printf '%s' "$1" | tr -d ' \t\r\n')
+    [[ -n "$v" ]] || return 1
+    [[ "$v" == http://* || "$v" == https://* ]] || v="https://$v"
+    v=${v%/}
+    [[ "$v" == *"://"?* ]] || return 1
+    printf '%s' "$v"
+}
+
 # 落盘供后续 `sing2 update` 使用。先建临时文件再改权限再搬运：umask 宽松的机器上
-# 直接 `> file` 会先留下一个 644 的密钥文件，哪怕随后 chmod 也已经有一个窗口。
-save_dist_key() {
-    [[ -n "$DIST_KEY" ]] || return 0
+# 直接 `> file` 会先留下一个 644 的文件，哪怕随后 chmod 也已经有一个窗口。
+write_secret_file() {
+    local dest=$1 value=$2 tmpf
+    [[ -n "$value" ]] || return 0
     mkdir -p "${CONF_DIR}"
-    local tmpf
-    tmpf=$(mktemp "${DIST_KEY_FILE}.XXXXXX") || return 1
+    tmpf=$(mktemp "${dest}.XXXXXX") || return 1
     chmod 600 "$tmpf"
-    printf '%s' "$DIST_KEY" > "$tmpf"
-    mv -f "$tmpf" "$DIST_KEY_FILE" || { rm -f "$tmpf"; return 1; }
-    chmod 600 "$DIST_KEY_FILE"
+    printf '%s' "$value" > "$tmpf"
+    mv -f "$tmpf" "$dest" || { rm -f "$tmpf"; return 1; }
+    chmod 600 "$dest"
+    return 0
+}
+
+save_dist_config() {
+    write_secret_file "$DIST_BASE_FILE" "$DIST_BASE" || return 1
+    write_secret_file "$DIST_KEY_FILE" "$DIST_KEY" || return 1
     return 0
 }
 
@@ -154,9 +162,9 @@ have_downloader() {
     command -v curl >/dev/null 2>&1 || command -v wget >/dev/null 2>&1
 }
 
-# 拿 latest 当试金石验证密钥：它是桶里最小的对象，而端点对「密钥错」与「路径不
-# 存在」返回同一个 404，所以「取得到」就等价于「密钥对」。
-verify_dist_key() {
+# 拿 latest 当试金石：它是最小的对象，而端点对「密钥错」与「路径不存在」返回同一个
+# 404，所以「取得到」就等价于「端点和密钥都对」。
+verify_dist_config() {
     local vtmp rc=1
     vtmp=$(mktemp) || return 1
     fetch "${DIST_BASE}/latest" "$vtmp" && rc=0
@@ -164,77 +172,104 @@ verify_dist_key() {
     return $rc
 }
 
-# 交互式读入密钥。
+# 交互式读入端点与密钥。
 #
-# 为什么要单独找 /dev/tty 而不是直接 read：一键安装的推荐形式是
-# `bash <(curl -Ls ...)`，那种形式下 stdin 仍是终端，直接 read 就行；但总会有人
-# 写成 `curl -Ls ... | bash`，那时 stdin 是**脚本自己的字节流**，read 会把脚本的
-# 下一行当成密钥吃掉——表现为提示一闪而过、然后拿着一行 shell 代码去当密钥。
-# 从 /dev/tty 读则两种形式都正确。
+# 为什么单独找 /dev/tty 而不是直接 read：推荐用法 `bash <(curl -Ls ...)` 下 stdin
+# 仍是终端，直接 read 就行；但写成 `curl -Ls ... | bash` 时 stdin 是脚本自己的字节
+# 流，read 会把脚本的下一行当成输入吃掉——表现为提示一闪而过、然后拿一行 shell
+# 代码去当密钥。从 /dev/tty 读则两种形式都正确。
 #
-# 非交互环境（无 tty，比如 CI 或 cron）**不提示**，直接返回 1 让调用方打印错误并
-# 退出。在那种地方卡在 read 上会变成一个静默挂起，比一条错误难查得多。
-prompt_dist_key() {
+# 非交互环境（无 tty，比如 CI 或 cron）不提示，直接返回 1 让调用方报错退出。在那种
+# 地方卡在 read 上会变成静默挂起，比一条错误难查得多。
+prompt_dist_config() {
     local tty=/dev/tty
     [[ -r "$tty" && -w "$tty" ]] || tty=""
     [[ -n "$tty" || -t 0 ]] || return 1
 
-    echo -e "${yellow}二进制托管在需要鉴权的分发端点上，需要分发密钥。${plain}"
-    echo -e "输入一次即可——验证通过后会写入 ${green}${DIST_KEY_FILE}${plain}（600），"
+    echo -e "${yellow}需要分发端点与密钥才能下载 Sing2。${plain}"
+    echo -e "输入一次即可——验证通过后写入 ${green}${CONF_DIR}${plain}（600），"
     echo -e "此后 ${green}sing2 update${plain} 自动读取，不再需要输入。"
 
-    local attempt key
+    local attempt base key
     for attempt in 1 2 3; do
-        if [[ -n "$tty" ]]; then
-            printf '请输入分发密钥（不回显）: ' > "$tty"
-            IFS= read -rs key < "$tty"
-            printf '\n' > "$tty"
+        # 端点回显：它不是密码，看得见才能发现打错。已有值时回车即沿用。
+        if [[ -n "$DIST_BASE" ]]; then
+            _prompt "$tty" "分发端点 [${DIST_BASE}]: "
         else
-            printf '请输入分发密钥（不回显）: '
-            IFS= read -rs key
-            printf '\n'
+            _prompt "$tty" "分发端点（形如 https://example.com）: "
         fi
-        # IFS= 关掉了 read 自带的首尾裁剪，这里显式裁——粘贴带进空格或回车太常见了。
-        key=$(printf '%s' "$key" | tr -d ' \t\r\n')
-
-        if [[ -z "$key" ]]; then
-            echo -e "${yellow}没有读到任何内容${plain}（第 ${attempt}/3 次）"
+        _read_line "$tty" base
+        if [[ -n "$base" ]]; then
+            base=$(normalize_dist_base "$base") || base=""
+            if [[ -z "$base" ]]; then
+                echo -e "${yellow}端点格式不对${plain}（第 ${attempt}/3 次）"
+                continue
+            fi
+            DIST_BASE="$base"
+        fi
+        if [[ -z "$DIST_BASE" ]]; then
+            echo -e "${yellow}端点不能为空${plain}（第 ${attempt}/3 次）"
             continue
         fi
 
+        _prompt "$tty" "分发密钥（不回显）: "
+        _read_line "$tty" key silent
+        if [[ -z "$key" ]]; then
+            echo -e "${yellow}没有读到密钥${plain}（第 ${attempt}/3 次）"
+            continue
+        fi
         DIST_KEY="$key"
 
-        # install_base 之前 curl/wget 可能都还没装，那就没法验证。此时先收下，
-        # 让后面正常的下载路径去暴露问题——总比在这里报一个「密钥无效」要好，
-        # 那会把「没有下载工具」误诊成「密钥错了」。
+        # install_base 之前 curl/wget 可能都还没装，那就没法验证。此时先收下，让
+        # 后面正常的下载路径去暴露问题——否则会把「本机没有下载工具」误诊成
+        # 「端点或密钥错了」。
         if ! have_downloader; then
-            save_dist_key && echo -e "${green}已保存${plain}（尚未验证：本机还没有 curl/wget）"
+            save_dist_config && echo -e "${green}已保存${plain}（尚未验证：本机还没有 curl/wget）"
             return 0
         fi
 
-        if verify_dist_key; then
-            echo -e "${green}密钥有效${plain}"
-            save_dist_key ||
-                echo -e "${yellow}写入 ${DIST_KEY_FILE} 失败${plain}，下次更新需要重新输入"
+        if verify_dist_config; then
+            echo -e "${green}端点与密钥有效${plain}"
+            save_dist_config ||
+                echo -e "${yellow}写入 ${CONF_DIR} 失败${plain}，下次更新需要重新输入"
             return 0
         fi
 
+        # 验证失败时无法区分是端点错还是密钥错——端点对二者返回同一个 404。所以
+        # 两个都重新问，端点带上刚才的值当默认，回车即沿用。
         DIST_KEY=""
-        echo -e "${red}密钥无效或端点不可达${plain}（第 ${attempt}/3 次）"
-        echo -e "  端点对「密钥错误」与「路径不存在」返回同一个 404，无法从响应上区分。"
+        echo -e "${red}取不到内容${plain}（第 ${attempt}/3 次）——端点不可达、端点写错、或密钥不对"
     done
     return 1
 }
 
-# 在**发请求之前**拦住，而不是让请求打到 Worker 拿一个语焉不详的 404
-# （无密钥、错密钥、路径不存在在那边是同一个响应，见 cloudflare/worker.js）。
-require_dist_key() {
-    [[ -n "$DIST_KEY" ]] && return 0
-    prompt_dist_key && return 0
-    echo -e "${red}缺少分发密钥${plain}——二进制托管在需要鉴权的分发端点上。"
-    echo -e "  本次带上：${green}DIST_KEY=你的密钥 bash install.sh${plain}"
+# 提示与读入的两个小助手：把「有 tty 就走 tty、否则走 stdin」这件事收在一处，
+# 免得每个分支都写两遍。
+_prompt() {
+    local tty=$1 text=$2
+    if [[ -n "$tty" ]]; then printf '%s' "$text" > "$tty"; else printf '%s' "$text"; fi
+}
+
+_read_line() {
+    local tty=$1 __var=$2 silent=${3:-} __v
+    # IFS= 关掉 read 自带的首尾裁剪，读完显式裁——粘贴带进空格或回车太常见了。
+    if [[ -n "$tty" ]]; then
+        if [[ -n "$silent" ]]; then IFS= read -rs __v < "$tty"; printf '\n' > "$tty"
+        else IFS= read -r __v < "$tty"; fi
+    else
+        if [[ -n "$silent" ]]; then IFS= read -rs __v; printf '\n'
+        else IFS= read -r __v; fi
+    fi
+    printf -v "$__var" '%s' "$(printf '%s' "$__v" | tr -d ' \t\r\n')"
+}
+
+# 在发请求之前拦住，而不是让请求打过去拿一个语焉不详的 404。
+require_dist_config() {
+    [[ -n "$DIST_BASE" && -n "$DIST_KEY" ]] && return 0
+    prompt_dist_config && return 0
+    echo -e "${red}缺少分发端点或密钥${plain}"
+    echo -e "  本次带上：${green}DIST_BASE=… DIST_KEY=… bash install.sh${plain}"
     echo -e "  或写入后长期生效：${green}sing2 key${plain}"
-    echo -e "  手工写入亦可：${green}printf '%s' '你的密钥' > ${DIST_KEY_FILE} && chmod 600 ${DIST_KEY_FILE}${plain}"
     exit 1
 }
 
@@ -606,11 +641,9 @@ install_Sing2() {
     # 空串必须当成"没指定版本"。`sing2 update` 直接回车会把一个空参数一路传到这里，
     # 而老逻辑只看 $#，于是拼出 .../download//Sing2-linux-64.zip 然后 404。
     if [[ $# -eq 0 || -z "$1" ]]; then
-        # 版本号取自分发端点上的 latest 对象，不再解析 api.github.com 的 JSON：
-        # Sing2 仓库转私有后那个接口匿名 404。顺带把解析 JSON 那段也省了。
-        # latest 由发布流水线在**全部资产上传成功之后**才更新，所以这里读到的
-        # 版本号必然是完整的（release.yml mirror-r2）。
-        require_dist_key
+        # 版本号取自端点上的 latest 对象。它在一个版本的全部产物上传成功之后才
+        # 更新，所以这里读到的版本号对应的资产必然是齐的。
+        require_dist_config
         local vtmp
         vtmp=$(mktemp) || { echo -e "${red}无法创建临时文件${plain}"; exit 1; }
         if fetch "${DIST_BASE}/latest" "$vtmp"; then
@@ -653,13 +686,13 @@ install_Sing2() {
     fi
     [[ -n "$current" ]] && echo -e "当前版本：${yellow}${current}${plain} → ${green}${last_version}${plain}"
 
-    require_dist_key
+    require_dist_config
     url="${DIST_BASE}/${last_version}/Sing2-${arch}.zip"
 
     # 下载到临时目录再落盘：直接删 INSTALL_DIR 会在下载失败时把一个能跑的节点
     # 变成一个删干净的节点。
-    # tmp **刻意不声明成 local**，清理由文件头的 cleanup_tmp/EXIT trap 负责——
-    # 声明成 local 正是 doc/08 R22(a) 那个问题。
+    # tmp **刻意不声明成 local**：清理由文件头的 cleanup_tmp/EXIT trap 负责，而
+    # EXIT 在函数返回之后才触发，那时 local 已经销毁。
     tmp=$(mktemp -d) || { echo -e "${red}无法创建临时目录${plain}"; exit 1; }
 
     echo -e "下载：${url}"
@@ -669,16 +702,14 @@ install_Sing2() {
         exit 1
     fi
 
-    # 校验和验证。.dgst 与 zip 一同发布（release.yml 的 Create ZIP archive 步骤，
-    # 形如 `SHA256= <hex>`），但此前一直没有任何一方验过它。分发从 GitHub 挪到
-    # 自建端点之后更值得补上。
+    # 校验和验证。每个 zip 旁边都有一个同名 .dgst，内容形如 `SHA256= <hex>`。
     # 拿不到 .dgst 时降级为不验证而非失败：它是加固措施，不该让一个次要对象缺失
     # 把安装拦死。
     if fetch "${url}.dgst" "${tmp}/Sing2.zip.dgst" && command -v sha256sum >/dev/null 2>&1; then
         local want got
         # ⚠ 标签形态随 openssl 大版本变：3.x 打印 "SHA2-256= <hex>"，1.1.1 打印
-        # "SHA256= <hex>"。老 release 的 .dgst 是当时的 runner 生成的，而
-        # `sing2 update v0.1.5` 允许装回旧版本，所以两种都必须认。
+        # "SHA256= <hex>"。旧版本的 .dgst 是当时的构建机生成的，而装回旧版本是
+        # 允许的，所以两种都必须认。
         # 末尾再要求 64 位十六进制：匹配到意外的行时宁可判定为"没有期望值"（降级
         # 为不验证），也不要拿一段垃圾去比对然后报一个假的校验失败。
         want=$(grep -iE '^SHA-?2?-?256=' "${tmp}/Sing2.zip.dgst" 2>/dev/null |
@@ -710,17 +741,16 @@ install_Sing2() {
     fi
 
     mkdir -p "${INSTALL_DIR}" "${CONF_DIR}"
-    # 密钥落盘，供后续 `sing2 update` 免输使用。放在这里而不是更早：只有确实下载
-    # 成功过，才说明这把密钥是对的，值得存。
-    # 交互式输入那条路已经在验证通过时存过了，这里只覆盖 DIST_KEY= 环境变量／
-    # --dist-key 参数那条路；已经存在就不再重复报喜。
-    local key_was_stored=0
-    [[ -s "$DIST_KEY_FILE" ]] && key_was_stored=1
-    if save_dist_key; then
-        [[ $key_was_stored == 1 ]] ||
-            echo -e "分发密钥已保存到 ${green}${DIST_KEY_FILE}${plain}（600），后续 ${green}sing2 update${plain} 不再需要提供"
+    # 端点与密钥落盘，供后续 `sing2 update` 免输使用。放在这里而不是更早：只有确实
+    # 下载成功过，才说明这两个值是对的，值得存。交互式那条路在验证通过时已经存过，
+    # 这里覆盖的是环境变量／命令行参数那条路；已经存在就不再重复报喜。
+    local was_stored=0
+    [[ -s "$DIST_KEY_FILE" && -s "$DIST_BASE_FILE" ]] && was_stored=1
+    if save_dist_config; then
+        [[ $was_stored == 1 ]] ||
+            echo -e "分发端点与密钥已保存到 ${green}${CONF_DIR}${plain}（600），后续 ${green}sing2 update${plain} 不再需要提供"
     else
-        echo -e "${yellow}分发密钥写入 ${DIST_KEY_FILE} 失败${plain}，下次更新需要重新提供"
+        echo -e "${yellow}写入 ${CONF_DIR} 失败${plain}，下次更新需要重新提供"
     fi
     install -m 755 "${tmp}/unpacked/sing2" "${INSTALL_DIR}/sing2"
 
@@ -784,33 +814,43 @@ install_Sing2() {
     echo "------------------------------------------"
 }
 
-# --force/-f 与 --dist-key 从参数里摘出来，剩下的才是版本号。
+# 选项从参数里摘出来，剩下的才是版本号。
 FORCE=0
 declare -a install_args=()
-expect_key=0
+expect=""
 for a in "$@"; do
-    if [[ $expect_key == 1 ]]; then
-        DIST_KEY="$a"
-        expect_key=0
+    if [[ -n "$expect" ]]; then
+        printf -v "$expect" '%s' "$a"
+        expect=""
         continue
     fi
     case "$a" in
         -f|--force)     FORCE=1 ;;
-        --dist-key)     expect_key=1 ;;
+        --dist-key)     expect=DIST_KEY ;;
         --dist-key=*)   DIST_KEY="${a#*=}" ;;
+        --dist-base)    expect=DIST_BASE ;;
+        --dist-base=*)  DIST_BASE="${a#*=}" ;;
         "")             ;;   # 空参数忽略：`sing2 update` 回车曾把空串一路传下来
         *)              install_args+=("$a") ;;
     esac
 done
 
-# 环境变量/命令行没给就读落盘文件。要在 install_Sing2 之前，fetch() 靠 $DIST_KEY
-# 决定是否给分发端点带认证头。
-load_dist_key
+# 环境变量/命令行给的端点也要过一遍规整（补协议、去尾斜杠），否则 fetch() 的前缀
+# 判断会失配。
+if [[ -n "$DIST_BASE" ]]; then
+    DIST_BASE=$(normalize_dist_base "$DIST_BASE") || {
+        echo -e "${red}DIST_BASE 格式不对${plain}"
+        exit 1
+    }
+fi
 
-# 密钥的索取放在 install_base **之前**：装包要好几分钟，让人等完再被问密钥、
-# 输错了又得从头来，是最难受的顺序。已有密钥（环境变量或落盘文件）时这里是空操作，
-# 所以 `sing2 update` 不会因此多出一次提问。
-require_dist_key
+# 环境变量/命令行没给就读落盘文件。要在 install_Sing2 之前，fetch() 靠这两个值
+# 决定 URL 与是否附加认证头。
+load_dist_config
+
+# 索取放在 install_base **之前**：装包要好几分钟，让人等完再被问、输错了又得从头
+# 来，是最难受的顺序。已有值时这里是空操作，所以 `sing2 update` 不会多出一次提问。
+require_dist_config
 
 echo -e "${green}开始安装 Sing2${plain}"
 install_base

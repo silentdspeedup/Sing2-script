@@ -13,13 +13,12 @@ green='\033[0;32m'
 yellow='\033[0;33m'
 plain='\033[0m'
 
-# Sing2 本体仓库已转为私有，本脚本不再引用它——二进制由 install.sh 从分发端点取，
-# 脚本层走公开的 SCRIPT_REPO。
 SCRIPT_REPO="silentdspeedup/Sing2-script"
 BIN="/usr/local/Sing2/sing2"
 CONF_DIR="/etc/Sing2"
 CONF="${CONF_DIR}/config.yml"
-# 分发密钥。本脚本只负责写入与展示，实际使用它的是 install.sh（doc/16 §5）。
+# 分发端点与密钥。本脚本只负责写入与展示，实际使用它们的是 install.sh。
+DIST_BASE_FILE="${CONF_DIR}/dist_base"
 DIST_KEY_FILE="${CONF_DIR}/dist_key"
 SERVICE="Sing2"
 
@@ -104,28 +103,57 @@ update() {
     [[ $# == 0 ]] && before_show_menu
 }
 
-# dist_key —— 写入/轮换分发密钥。
+# 写文件：先建临时文件再改权限再搬运。umask 宽松的机器上直接 `> file` 会先留下一个
+# 644 的文件，哪怕随后 chmod 也已经有一个窗口。
+write_secret_file() {
+    local dest=$1 value=$2 tmpf
+    mkdir -p "${CONF_DIR}"
+    tmpf=$(mktemp "${dest}.XXXXXX") || return 1
+    chmod 600 "$tmpf"
+    printf '%s' "$value" > "$tmpf"
+    mv -f "$tmpf" "$dest" || { rm -f "$tmpf"; return 1; }
+    chmod 600 "$dest"
+    return 0
+}
+
+# dist_key —— 写入/轮换分发端点与密钥。
 #
-# 存在的理由：二进制托管在需要鉴权的分发端点上，没有这把密钥 `sing2 update` 会在
-# 下载前就停下。轮换时（分发端先加 DIST_KEY_NEXT，节点逐台换，最后收掉旧的）每台
-# 机器要改的就是这一个文件，值得给它一条命令而不是让人手敲 printf + chmod。
-#
-# 用 read -rs 而不是接命令行参数：密钥进 shell history 是最常见的泄露方式。
+# 用 read -rs 读密钥而不是接命令行参数：那是最常见的泄露方式（shell history、
+# ps 的命令行都是可读的）。端点则回显，看得见才能发现打错。
 dist_key() {
-    local key confirm_key
+    local base key confirm_key cur
+
+    if [[ -s "$DIST_BASE_FILE" ]]; then
+        cur=$(tr -d ' \t\r\n' < "$DIST_BASE_FILE")
+        echo -e "当前端点：${green}${cur}${plain}"
+    else
+        cur=""
+        echo -e "当前${yellow}未设置${plain}端点"
+    fi
+    echo -n "输入端点（回车沿用当前值）: "
+    read -r base
+    base=$(printf '%s' "$base" | tr -d ' \t\r\n')
+    [[ -z "$base" ]] && base="$cur"
+    if [[ -z "$base" ]]; then
+        echo -e "${red}端点不能为空${plain}，未做改动"
+        [[ $# == 0 ]] && before_show_menu
+        return 1
+    fi
+    [[ "$base" == http://* || "$base" == https://* ]] || base="https://$base"
+    base=${base%/}   # 结尾斜杠会让下载时的前缀判断失配，认证头就带不上
+
     if [[ -s "$DIST_KEY_FILE" ]]; then
-        local cur
         cur=$(tr -d ' \t\r\n' < "$DIST_KEY_FILE")
         # 只回显首尾各 4 位：足够确认「是不是同一把」，又不至于把整把打到屏幕上
         # （运维经常在录屏或共享终端里跑这个）。
         echo -e "当前密钥：${green}${cur:0:4}…${cur: -4}${plain}（长度 ${#cur}）"
     else
-        echo -e "当前${yellow}未设置${plain}分发密钥"
+        echo -e "当前${yellow}未设置${plain}密钥"
     fi
-
     echo -n "输入新密钥（留空取消，输入时不回显）: "
     read -rs key
     echo
+    key=$(printf '%s' "$key" | tr -d ' \t\r\n')
     if [[ -z "$key" ]]; then
         echo -e "${yellow}已取消，未做改动${plain}"
         [[ $# == 0 ]] && before_show_menu
@@ -134,27 +162,21 @@ dist_key() {
     echo -n "再输入一次确认: "
     read -rs confirm_key
     echo
+    confirm_key=$(printf '%s' "$confirm_key" | tr -d ' \t\r\n')
     if [[ "$key" != "$confirm_key" ]]; then
         echo -e "${red}两次输入不一致，未做改动${plain}"
         [[ $# == 0 ]] && before_show_menu
         return 1
     fi
 
-    mkdir -p "${CONF_DIR}"
-    # 先建临时文件再改权限再搬运：umask 宽松的机器上直接 `> file` 会先留下一个
-    # 644 的密钥文件，哪怕随后 chmod 也已经有一个窗口。
-    local tmpf
-    tmpf=$(mktemp "${DIST_KEY_FILE}.XXXXXX") || {
-        echo -e "${red}无法创建临时文件${plain}"
+    if ! write_secret_file "$DIST_BASE_FILE" "$base" ||
+       ! write_secret_file "$DIST_KEY_FILE" "$key"; then
+        echo -e "${red}写入失败${plain}"
         [[ $# == 0 ]] && before_show_menu
         return 1
-    }
-    chmod 600 "$tmpf"
-    printf '%s' "$key" > "$tmpf"
-    mv -f "$tmpf" "$DIST_KEY_FILE" || { rm -f "$tmpf"; echo -e "${red}写入失败${plain}"; return 1; }
-    chmod 600 "$DIST_KEY_FILE"
-    echo -e "${green}已写入 ${DIST_KEY_FILE}${plain}（600，仅 root 可读）"
-    echo -e "验证：${green}sing2 update${plain}——密钥不对会在下载前报错，不会动到现有安装"
+    fi
+    echo -e "${green}已写入 ${CONF_DIR}${plain}（600，仅 root 可读）"
+    echo -e "验证：${green}sing2 update${plain}——不对会在下载前报错，不会动到现有安装"
     [[ $# == 0 ]] && before_show_menu
 }
 
@@ -643,7 +665,7 @@ generate_config_file() {
     echo -e "${red}注意事项：${plain}"
     echo -e "${red}1. 生成的配置会写入 ${CONF}${plain}"
     echo -e "${red}2. 原配置会备份为 ${CONF}.bak${plain}"
-    echo -e "${red}3. 向导只覆盖常用项，完整字段见 doc/09-config-and-migration.md${plain}"
+    echo -e "${red}3. 向导只覆盖常用项，其余字段直接编辑 config.yml${plain}"
     read -rp "是否继续？(y/n) " go_on
     if [[ ! $go_on =~ ^[yY]$ ]]; then
         echo -e "${red}已取消${plain}"
@@ -880,7 +902,7 @@ show_usage() {
     echo "sing2 update       - 更新到最新版"
     echo "sing2 update x.x.x - 更新到指定版本"
     echo "sing2 update -f    - 强制重装当前版本"
-    echo "sing2 key          - 写入/轮换分发密钥"
+    echo "sing2 key          - 写入/轮换分发端点与密钥"
     echo "sing2 install      - 安装"
     echo "sing2 uninstall    - 卸载"
     echo "sing2 version      - 查看版本"
@@ -912,7 +934,7 @@ show_menu() {
  ${green}14.${plain} 生成 Sing2 配置文件
  ${green}15.${plain} 放行 VPS 的所有网络端口
  ${green}16.${plain} 生成 REALITY 密钥对
- ${green}17.${plain} 写入/轮换分发密钥
+ ${green}17.${plain} 写入/轮换分发端点与密钥
  "
     show_status
     echo && read -rp "请输入选择 [0-17]: " num
