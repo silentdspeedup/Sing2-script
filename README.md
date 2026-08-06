@@ -1,6 +1,6 @@
 # Sing2-script
 
-[Sing2](https://github.com/silentdspeedup/Sing2) 的一键安装与管理脚本。
+Sing2 的一键安装与管理脚本。（Sing2 本体仓库为私有，二进制经下文的分发端点获取。）
 
 Sing2 是把 XrayR 的多租户计费后端搬到 **sing-box fork 单核** 上的实现：面板对接仍是
 SSpanel（mod_mu 系，传统版与 custom_config 版都支持），协议由 sing-box 承载。
@@ -11,18 +11,47 @@ SSpanel（mod_mu 系，传统版与 custom_config 版都支持），协议由 si
 
 ## 一键安装
 
+**本脚本是公开的，二进制不是。** 脚本层（`install.sh`、`Sing2.sh`、`Sing2.service`）无需
+任何凭据即可获取；Sing2 二进制托管在需要密钥的分发端点上，首次安装用 `DIST_KEY=` 传入
+（见「[分发密钥](#分发密钥)」）：
+
 ```bash
-bash <(curl -Ls https://raw.githubusercontent.com/silentdspeedup/Sing2-script/master/install.sh)
+DIST_KEY=你的密钥 bash <(curl -Ls https://raw.githubusercontent.com/silentdspeedup/Sing2-script/master/install.sh)
 ```
+
+密钥会以 600 权限落到 `/etc/Sing2/dist_key`，之后 `sing2 update` 自动读取，不必再输。
 
 安装指定版本（`v` 前缀可省）：
 
 ```bash
-bash <(curl -Ls https://raw.githubusercontent.com/silentdspeedup/Sing2-script/master/install.sh) v1.0.0
+DIST_KEY=你的密钥 bash <(curl -Ls https://raw.githubusercontent.com/silentdspeedup/Sing2-script/master/install.sh) v1.0.0
 ```
 
 已装同一版本时安装脚本会直接报"无需更新"并退出（退出码 10），只刷新管理脚本，
 不动二进制和配置。要强制重装加 `--force`。
+
+### 支持的架构
+
+只发布 Linux 侧的这几个（`uname -m` 自动识别，装错架构会在下载前就停下）：
+
+`linux-64`、`linux-32`、`linux-arm64-v8a`、`linux-arm32-v7a`、`linux-arm32-v6`、
+`linux-arm32-v5`、`linux-s390x`、`linux-riscv64`、`linux-ppc64le`
+
+### 分发密钥
+
+二进制走一个带鉴权的分发端点（Cloudflare R2 + Worker 网关），下载时以
+`X-Sing2-Key` 请求头校验。密钥**只能下载已发布的二进制**——不涉及源码、不涉及写权限。
+
+| 场景 | 做法 |
+|---|---|
+| 首次安装 | `DIST_KEY=… bash <(curl -Ls …/install.sh)` |
+| 已装节点写入/轮换 | `sing2 key`（输入不回显，不进 shell history） |
+| 手工写入 | `printf '%s' '密钥' > /etc/Sing2/dist_key && chmod 600 /etc/Sing2/dist_key` |
+
+没有密钥时 `sing2 update` 会在**下载之前**停下并提示，不会动到现有安装。密钥错误与
+版本不存在在端点侧返回的是同一个 404，无法从响应上区分——报错信息里也这么写了。
+
+网关实现见 [`cloudflare/worker.js`](cloudflare/worker.js)。
 
 ## 使用
 
@@ -46,6 +75,7 @@ sing2 x25519       生成 REALITY 密钥对
 sing2 update       更新到最新版（已是最新则提示"无需更新"，不重装）
 sing2 update x.x.x 更新到指定版本
 sing2 update -f    强制重装当前版本（修复被改坏的安装）
+sing2 key          写入/轮换分发密钥
 sing2 install      安装
 sing2 uninstall    卸载
 sing2 version      查看版本
@@ -57,6 +87,7 @@ sing2 version      查看版本
 |---|---|
 | `/usr/local/Sing2/sing2` | 二进制 |
 | `/etc/Sing2/config.yml` | 配置文件（升级不覆盖，权限 600） |
+| `/etc/Sing2/dist_key` | 分发密钥（权限 600，见「分发密钥」） |
 | `/etc/systemd/system/Sing2.service` | systemd 单元 |
 | `/usr/bin/sing2` | 本管理脚本 |
 | `/etc/Sing2/error.log` | 运行日志（sing-box 侧） |
@@ -68,8 +99,8 @@ sing2 version      查看版本
 
 ## 配置
 
-字段规范见 Sing2 仓库的 [`doc/09-config-and-migration.md`](https://github.com/silentdspeedup/Sing2/blob/master/doc/09-config-and-migration.md)。
-本仓库 [`config/config.yml`](config/config.yml) 是带注释的完整示例。
+本仓库 [`config/config.yml`](config/config.yml) 是带注释的完整示例，字段说明就在注释里。
+（完整字段规范在 Sing2 仓库的 `doc/09-config-and-migration.md`，该仓库为私有。）
 
 几个容易踩的点：
 

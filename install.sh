@@ -2,12 +2,17 @@
 # SPDX-License-Identifier: GPL-3.0-or-later
 #
 # Sing2 一键安装脚本
-#   bash <(curl -Ls https://raw.githubusercontent.com/silentdspeedup/Sing2-script/master/install.sh)
+#   DIST_KEY=xxx bash <(curl -Ls https://raw.githubusercontent.com/silentdspeedup/Sing2-script/master/install.sh)
 #   bash <(curl -Ls .../install.sh) v1.2.3     # 安装指定版本
+#
+# 本脚本本身是公开的，无需凭据即可获取；**二进制**托管在需要密钥的分发端点上
+# （见下方「分发端点」一节）。首次安装用 DIST_KEY= 传入，之后落盘到
+# /etc/Sing2/dist_key，`sing2 update` 自动读取。
 #
 # 布局（与 Sing2.service / Sing2.sh 一致）：
 #   /usr/local/Sing2/sing2        二进制
 #   /etc/Sing2/config.yml         配置（升级不覆盖）
+#   /etc/Sing2/dist_key           分发密钥（600）
 #   /usr/bin/sing2                管理脚本（sing2 / Sing2 大小写均可）
 
 set -o pipefail
@@ -17,10 +22,26 @@ green='\033[0;32m'
 yellow='\033[0;33m'
 plain='\033[0m'
 
-REPO="silentdspeedup/Sing2"
+# Sing2 本体仓库已转为私有，本脚本不再引用它——二进制走下面的分发端点，
+# 脚本层走公开的 SCRIPT_REPO。
 SCRIPT_REPO="silentdspeedup/Sing2-script"
 INSTALL_DIR="/usr/local/Sing2"
 CONF_DIR="/etc/Sing2"
+
+# ---------- 分发端点 ----------
+# 二进制不再从 GitHub Release 取：Sing2 仓库已转为私有，那条路匿名一律 404。
+# 现在走 Cloudflare R2，前面挡一层 Worker 做密钥校验（方案见 Sing2 仓库 doc/16）。
+#
+# 注意这里的**不对称**：本脚本所在的 Sing2-script 仓库仍是公开的，所以脚本层
+# （install.sh / Sing2.sh / Sing2.service）继续走 raw.githubusercontent.com，
+# 不需要任何凭据 —— 只有下载二进制才需要密钥。一键安装的入口命令因此一个字都没变，
+# 存量节点也能靠公开的脚本层自己升级上来。
+#
+# ⚠ 部署 Worker 后把下面这行换成实际域名（Cloudflare 分配的 *.workers.dev）。
+# 日后要改自有域名，也只改这一行。
+DIST_BASE="${DIST_BASE:-https://sing2-dist.EXAMPLE.workers.dev}"
+DIST_KEY_FILE="${CONF_DIR}/dist_key"
+DIST_KEY="${DIST_KEY:-}"
 
 cur_dir=$(pwd)
 
@@ -78,10 +99,44 @@ detect_arch() {
 arch=$(detect_arch)
 if [[ -z "$arch" ]]; then
     echo -e "${red}不支持的 CPU 架构：$(uname -m)${plain}"
-    echo -e "已发布的架构见 https://github.com/${REPO}/releases"
+    echo -e "支持的架构见 https://github.com/${SCRIPT_REPO}#支持的架构"
     exit 1
 fi
 echo -e "架构：${green}${arch}${plain}"
+
+# ---------- 分发密钥 ----------
+# 优先级：环境变量/命令行 > 落盘文件。只有下载二进制用得上它。
+load_dist_key() {
+    [[ -n "$DIST_KEY" ]] && return 0
+    [[ -r "$DIST_KEY_FILE" ]] || return 0
+    DIST_KEY=$(tr -d ' \t\r\n' < "$DIST_KEY_FILE")
+    return 0
+}
+
+# 落盘供后续 `sing2 update` 使用。先建临时文件再改权限再搬运：umask 宽松的机器上
+# 直接 `> file` 会先留下一个 644 的密钥文件，哪怕随后 chmod 也已经有一个窗口。
+save_dist_key() {
+    [[ -n "$DIST_KEY" ]] || return 0
+    mkdir -p "${CONF_DIR}"
+    local tmpf
+    tmpf=$(mktemp "${DIST_KEY_FILE}.XXXXXX") || return 1
+    chmod 600 "$tmpf"
+    printf '%s' "$DIST_KEY" > "$tmpf"
+    mv -f "$tmpf" "$DIST_KEY_FILE" || { rm -f "$tmpf"; return 1; }
+    chmod 600 "$DIST_KEY_FILE"
+    return 0
+}
+
+# 在**发请求之前**拦住，而不是让请求打到 Worker 拿一个语焉不详的 404
+# （无密钥、错密钥、路径不存在在那边是同一个响应，见 cloudflare/worker.js）。
+require_dist_key() {
+    [[ -n "$DIST_KEY" ]] && return 0
+    echo -e "${red}缺少分发密钥${plain}——二进制托管在需要鉴权的分发端点上。"
+    echo -e "  本次带上：${green}DIST_KEY=你的密钥 bash install.sh${plain}"
+    echo -e "  或写入后长期生效：${green}sing2 key${plain}"
+    echo -e "  手工写入亦可：${green}printf '%s' '你的密钥' > ${DIST_KEY_FILE} && chmod 600 ${DIST_KEY_FILE}${plain}"
+    exit 1
+}
 
 # fetch URL → 本地文件。
 #
@@ -94,6 +149,13 @@ echo -e "架构：${green}${arch}${plain}"
 #     "Unit not found" —— 正是最难排查的那种状态。
 fetch() {
     local url=$1 dest=$2 tmpf
+    # 只给分发端点带密钥。其余 URL（raw.githubusercontent.com）本就是公开的，
+    # 把密钥发过去等于白白多一处泄露面。
+    local -a curl_auth=() wget_auth=()
+    if [[ -n "$DIST_KEY" && "$url" == "${DIST_BASE}/"* ]]; then
+        curl_auth=(-H "X-Sing2-Key: ${DIST_KEY}")
+        wget_auth=(--header="X-Sing2-Key: ${DIST_KEY}")
+    fi
     # 临时文件建在**目标同目录**，不要用 /tmp。
     # mv 会把源文件的 SELinux 上下文一起搬过去；从 /tmp 搬进 /etc/systemd/system 的
     # 文件会带着 user_tmp_t 标签落地，PID 1 读不了，systemd 就把这个 unit 记成 bad
@@ -101,9 +163,11 @@ fetch() {
     # 建在同目录则由策略的 type_transition 给出正确标签。
     tmpf=$(mktemp "${dest}.XXXXXX" 2>/dev/null) || tmpf=$(mktemp) || return 1
     if command -v curl >/dev/null 2>&1; then
-        curl -fsSL --retry 3 --connect-timeout 15 -o "$tmpf" "$url" || { rm -f "$tmpf"; return 1; }
+        curl -fsSL --retry 3 --connect-timeout 15 "${curl_auth[@]}" -o "$tmpf" "$url" ||
+            { rm -f "$tmpf"; return 1; }
     elif command -v wget >/dev/null 2>&1; then
-        wget -q --no-check-certificate -O "$tmpf" "$url" || { rm -f "$tmpf"; return 1; }
+        wget -q --no-check-certificate "${wget_auth[@]}" -O "$tmpf" "$url" ||
+            { rm -f "$tmpf"; return 1; }
     else
         echo -e "${red}系统既没有 curl 也没有 wget${plain}"
         return 1
@@ -131,7 +195,7 @@ write_builtin_unit() {
     cat > /etc/systemd/system/Sing2.service <<'UNIT'
 [Unit]
 Description=Sing2 Service
-Documentation=https://github.com/silentdspeedup/Sing2
+Documentation=https://github.com/silentdspeedup/Sing2-script
 After=network.target nss-lookup.target
 Wants=network.target
 
@@ -442,11 +506,22 @@ install_Sing2() {
     # 空串必须当成"没指定版本"。`sing2 update` 直接回车会把一个空参数一路传到这里，
     # 而老逻辑只看 $#，于是拼出 .../download//Sing2-linux-64.zip 然后 404。
     if [[ $# -eq 0 || -z "$1" ]]; then
-        last_version=$(curl -Ls "https://api.github.com/repos/${REPO}/releases/latest" |
-            grep '"tag_name":' | sed -E 's/.*"([^"]+)".*/\1/')
+        # 版本号取自分发端点上的 latest 对象，不再解析 api.github.com 的 JSON：
+        # Sing2 仓库转私有后那个接口匿名 404。顺带把解析 JSON 那段也省了。
+        # latest 由发布流水线在**全部资产上传成功之后**才更新，所以这里读到的
+        # 版本号必然是完整的（release.yml mirror-r2）。
+        require_dist_key
+        local vtmp
+        vtmp=$(mktemp) || { echo -e "${red}无法创建临时文件${plain}"; exit 1; }
+        if fetch "${DIST_BASE}/latest" "$vtmp"; then
+            last_version=$(tr -d ' \t\r\n' < "$vtmp")
+        fi
+        rm -f "$vtmp"
         if [[ -z "$last_version" ]]; then
-            echo -e "${red}获取 Sing2 最新版本失败${plain}（可能触发了 GitHub API 限流）"
-            echo -e "可手动指定版本：${yellow}bash install.sh v1.0.0${plain}"
+            echo -e "${red}获取 Sing2 最新版本失败${plain}"
+            echo -e "  分发端点不可达，或密钥无效——密钥错误与路径不存在返回的是同一个 404。"
+            echo -e "  端点：${yellow}${DIST_BASE}${plain}"
+            echo -e "  可手动指定版本：${yellow}bash install.sh v1.0.0${plain}"
             exit 1
         fi
         echo -e "检测到最新版本：${green}${last_version}${plain}，开始安装"
@@ -478,7 +553,8 @@ install_Sing2() {
     fi
     [[ -n "$current" ]] && echo -e "当前版本：${yellow}${current}${plain} → ${green}${last_version}${plain}"
 
-    url="https://github.com/${REPO}/releases/download/${last_version}/Sing2-${arch}.zip"
+    require_dist_key
+    url="${DIST_BASE}/${last_version}/Sing2-${arch}.zip"
 
     # 下载到临时目录再落盘：直接删 INSTALL_DIR 会在下载失败时把一个能跑的节点
     # 变成一个删干净的节点。
@@ -488,9 +564,37 @@ install_Sing2() {
 
     echo -e "下载：${url}"
     if ! fetch "${url}" "${tmp}/Sing2.zip"; then
-        echo -e "${red}下载失败${plain}——请确认该版本存在，且服务器能访问 GitHub"
+        echo -e "${red}下载失败${plain}——请确认该版本存在、密钥正确，且服务器能访问分发端点"
+        echo -e "  分发端点对「密钥错误」与「版本不存在」返回同一个 404，无法从响应上区分。"
         exit 1
     fi
+
+    # 校验和验证。.dgst 与 zip 一同发布（release.yml 的 Create ZIP archive 步骤，
+    # 形如 `SHA256= <hex>`），但此前一直没有任何一方验过它。分发从 GitHub 挪到
+    # 自建端点之后更值得补上。
+    # 拿不到 .dgst 时降级为不验证而非失败：它是加固措施，不该让一个次要对象缺失
+    # 把安装拦死。
+    if fetch "${url}.dgst" "${tmp}/Sing2.zip.dgst" && command -v sha256sum >/dev/null 2>&1; then
+        local want got
+        # ⚠ 标签形态随 openssl 大版本变：3.x 打印 "SHA2-256= <hex>"，1.1.1 打印
+        # "SHA256= <hex>"。老 release 的 .dgst 是当时的 runner 生成的，而
+        # `sing2 update v0.1.5` 允许装回旧版本，所以两种都必须认。
+        # 末尾再要求 64 位十六进制：匹配到意外的行时宁可判定为"没有期望值"（降级
+        # 为不验证），也不要拿一段垃圾去比对然后报一个假的校验失败。
+        want=$(grep -iE '^SHA-?2?-?256=' "${tmp}/Sing2.zip.dgst" 2>/dev/null |
+            awk '{print $NF}' | grep -iE '^[0-9a-f]{64}$' | head -1)
+        got=$(sha256sum "${tmp}/Sing2.zip" | awk '{print $1}')
+        if [[ -n "$want" && "$want" != "$got" ]]; then
+            echo -e "${red}校验和不匹配，拒绝安装${plain}"
+            echo -e "  期望：${want}"
+            echo -e "  实际：${got}"
+            exit 1
+        fi
+        [[ -n "$want" ]] && echo -e "校验和：${green}sha256 匹配${plain}"
+    else
+        echo -e "${yellow}未能校验 sha256${plain}（.dgst 不可用或系统无 sha256sum），继续安装"
+    fi
+
     if ! unzip -q -o "${tmp}/Sing2.zip" -d "${tmp}/unpacked"; then
         echo -e "${red}解压失败，下载的文件可能不完整${plain}"
         exit 1
@@ -506,6 +610,9 @@ install_Sing2() {
     fi
 
     mkdir -p "${INSTALL_DIR}" "${CONF_DIR}"
+    # 密钥落盘，供后续 `sing2 update` 免输使用。放在这里而不是更早：只有确实下载
+    # 成功过，才说明这把密钥是对的，值得存。
+    save_dist_key || echo -e "${yellow}分发密钥写入 ${DIST_KEY_FILE} 失败${plain}，下次更新需要重新提供"
     install -m 755 "${tmp}/unpacked/sing2" "${INSTALL_DIR}/sing2"
 
     install_unit "${tmp}/unpacked/Sing2.service"
@@ -561,22 +668,35 @@ install_Sing2() {
     echo "sing2 update       - 更新到最新版"
     echo "sing2 update x.x.x - 更新到指定版本"
     echo "sing2 update -f    - 强制重装当前版本"
+    echo "sing2 key          - 写入/轮换分发密钥"
     echo "sing2 install      - 安装"
     echo "sing2 uninstall    - 卸载"
     echo "sing2 version      - 查看版本"
     echo "------------------------------------------"
 }
 
-# --force/-f 从版本号里摘出来，剩下的才是版本号。
+# --force/-f 与 --dist-key 从参数里摘出来，剩下的才是版本号。
 FORCE=0
 declare -a install_args=()
+expect_key=0
 for a in "$@"; do
+    if [[ $expect_key == 1 ]]; then
+        DIST_KEY="$a"
+        expect_key=0
+        continue
+    fi
     case "$a" in
-        -f|--force) FORCE=1 ;;
-        "")         ;;   # 空参数忽略：`sing2 update` 回车曾把空串一路传下来
-        *)          install_args+=("$a") ;;
+        -f|--force)     FORCE=1 ;;
+        --dist-key)     expect_key=1 ;;
+        --dist-key=*)   DIST_KEY="${a#*=}" ;;
+        "")             ;;   # 空参数忽略：`sing2 update` 回车曾把空串一路传下来
+        *)              install_args+=("$a") ;;
     esac
 done
+
+# 环境变量/命令行没给就读落盘文件。要在 install_Sing2 之前，fetch() 靠 $DIST_KEY
+# 决定是否给分发端点带认证头。
+load_dist_key
 
 echo -e "${green}开始安装 Sing2${plain}"
 install_base

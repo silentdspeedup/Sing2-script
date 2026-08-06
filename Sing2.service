@@ -1,6 +1,6 @@
 [Unit]
 Description=Sing2 Service
-Documentation=https://github.com/silentdspeedup/Sing2
+Documentation=https://github.com/silentdspeedup/Sing2-script
 After=network.target nss-lookup.target
 Wants=network.target
 

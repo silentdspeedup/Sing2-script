@@ -13,11 +13,14 @@ green='\033[0;32m'
 yellow='\033[0;33m'
 plain='\033[0m'
 
-REPO="silentdspeedup/Sing2"
+# Sing2 本体仓库已转为私有，本脚本不再引用它——二进制由 install.sh 从分发端点取，
+# 脚本层走公开的 SCRIPT_REPO。
 SCRIPT_REPO="silentdspeedup/Sing2-script"
 BIN="/usr/local/Sing2/sing2"
 CONF_DIR="/etc/Sing2"
 CONF="${CONF_DIR}/config.yml"
+# 分发密钥。本脚本只负责写入与展示，实际使用它的是 install.sh（doc/16 §5）。
+DIST_KEY_FILE="${CONF_DIR}/dist_key"
 SERVICE="Sing2"
 
 [[ $EUID -ne 0 ]] && echo -e "${red}错误：${plain} 必须以 root 运行此脚本\n" && exit 1
@@ -98,6 +101,60 @@ update() {
         10) ;;  # 已是最新，install.sh 自己说过了，别再报"更新完成"
         *)  ;;  # 失败，install.sh 已经打印过原因
     esac
+    [[ $# == 0 ]] && before_show_menu
+}
+
+# dist_key —— 写入/轮换分发密钥。
+#
+# 存在的理由：二进制托管在需要鉴权的分发端点上，没有这把密钥 `sing2 update` 会在
+# 下载前就停下。轮换时（分发端先加 DIST_KEY_NEXT，节点逐台换，最后收掉旧的）每台
+# 机器要改的就是这一个文件，值得给它一条命令而不是让人手敲 printf + chmod。
+#
+# 用 read -rs 而不是接命令行参数：密钥进 shell history 是最常见的泄露方式。
+dist_key() {
+    local key confirm_key
+    if [[ -s "$DIST_KEY_FILE" ]]; then
+        local cur
+        cur=$(tr -d ' \t\r\n' < "$DIST_KEY_FILE")
+        # 只回显首尾各 4 位：足够确认「是不是同一把」，又不至于把整把打到屏幕上
+        # （运维经常在录屏或共享终端里跑这个）。
+        echo -e "当前密钥：${green}${cur:0:4}…${cur: -4}${plain}（长度 ${#cur}）"
+    else
+        echo -e "当前${yellow}未设置${plain}分发密钥"
+    fi
+
+    echo -n "输入新密钥（留空取消，输入时不回显）: "
+    read -rs key
+    echo
+    if [[ -z "$key" ]]; then
+        echo -e "${yellow}已取消，未做改动${plain}"
+        [[ $# == 0 ]] && before_show_menu
+        return 0
+    fi
+    echo -n "再输入一次确认: "
+    read -rs confirm_key
+    echo
+    if [[ "$key" != "$confirm_key" ]]; then
+        echo -e "${red}两次输入不一致，未做改动${plain}"
+        [[ $# == 0 ]] && before_show_menu
+        return 1
+    fi
+
+    mkdir -p "${CONF_DIR}"
+    # 先建临时文件再改权限再搬运：umask 宽松的机器上直接 `> file` 会先留下一个
+    # 644 的密钥文件，哪怕随后 chmod 也已经有一个窗口。
+    local tmpf
+    tmpf=$(mktemp "${DIST_KEY_FILE}.XXXXXX") || {
+        echo -e "${red}无法创建临时文件${plain}"
+        [[ $# == 0 ]] && before_show_menu
+        return 1
+    }
+    chmod 600 "$tmpf"
+    printf '%s' "$key" > "$tmpf"
+    mv -f "$tmpf" "$DIST_KEY_FILE" || { rm -f "$tmpf"; echo -e "${red}写入失败${plain}"; return 1; }
+    chmod 600 "$DIST_KEY_FILE"
+    echo -e "${green}已写入 ${DIST_KEY_FILE}${plain}（600，仅 root 可读）"
+    echo -e "验证：${green}sing2 update${plain}——密钥不对会在下载前报错，不会动到现有安装"
     [[ $# == 0 ]] && before_show_menu
 }
 
@@ -823,6 +880,7 @@ show_usage() {
     echo "sing2 update       - 更新到最新版"
     echo "sing2 update x.x.x - 更新到指定版本"
     echo "sing2 update -f    - 强制重装当前版本"
+    echo "sing2 key          - 写入/轮换分发密钥"
     echo "sing2 install      - 安装"
     echo "sing2 uninstall    - 卸载"
     echo "sing2 version      - 查看版本"
@@ -832,7 +890,7 @@ show_usage() {
 show_menu() {
     echo -e "
   ${green}Sing2 后端管理脚本${plain}
---- https://github.com/${REPO} ---
+--- https://github.com/${SCRIPT_REPO} ---
   ${green}0.${plain} 修改配置
 ————————————————
   ${green}1.${plain} 安装 Sing2
@@ -854,9 +912,10 @@ show_menu() {
  ${green}14.${plain} 生成 Sing2 配置文件
  ${green}15.${plain} 放行 VPS 的所有网络端口
  ${green}16.${plain} 生成 REALITY 密钥对
+ ${green}17.${plain} 写入/轮换分发密钥
  "
     show_status
-    echo && read -rp "请输入选择 [0-16]: " num
+    echo && read -rp "请输入选择 [0-17]: " num
 
     case "${num}" in
         0) config ;;
@@ -876,7 +935,9 @@ show_menu() {
         14) generate_config_file ;;
         15) open_ports ;;
         16) check_install && gen_x25519 ;;
-        *) echo -e "${red}请输入正确的数字 [0-16]${plain}" ;;
+        # 不加 check_install：装不上正是因为缺密钥，这时候要求「先装好」是死循环。
+        17) dist_key ;;
+        *) echo -e "${red}请输入正确的数字 [0-17]${plain}" ;;
     esac
 }
 
@@ -893,6 +954,7 @@ if [[ $# -gt 0 ]]; then
         "config")    config "$@" ;;
         "generate")  generate_config_file 0 ;;
         "x25519")    gen_x25519 0 ;;
+        "key")       dist_key 0 ;;
         "install")   check_uninstall 0 && install 0 ;;
         "uninstall") check_install 0 && uninstall 0 ;;
         "version")   check_install 0 && show_Sing2_version 0 ;;
