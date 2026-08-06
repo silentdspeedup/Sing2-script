@@ -37,9 +37,10 @@ CONF_DIR="/etc/Sing2"
 # 不需要任何凭据 —— 只有下载二进制才需要密钥。一键安装的入口命令因此一个字都没变，
 # 存量节点也能靠公开的脚本层自己升级上来。
 #
-# ⚠ 部署 Worker 后把下面这行换成实际域名（Cloudflare 分配的 *.workers.dev）。
-# 日后要改自有域名，也只改这一行。
-DIST_BASE="${DIST_BASE:-https://sing2-dist.EXAMPLE.workers.dev}"
+# 日后要改自有域名，只改这一行。**结尾不要带斜杠** —— fetch() 用
+# `"$url" == "${DIST_BASE}/"*` 判断该不该附加认证头，多一个斜杠会让所有下载都
+# 匹配不上，于是不带密钥发出去、拿一个 404，而且报错信息完全看不出是这个原因。
+DIST_BASE="${DIST_BASE:-https://sing2-dist.mysecuritysys.workers.dev}"
 DIST_KEY_FILE="${CONF_DIR}/dist_key"
 DIST_KEY="${DIST_KEY:-}"
 
