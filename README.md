@@ -41,8 +41,13 @@ bash <(curl -Ls .../install.sh) --dist-base https://端点地址 --dist-key 密�
 
 `uname -m` 自动识别，不支持的架构会在下载前就停下：
 
-`linux-64`、`linux-32`、`linux-arm64-v8a`、`linux-arm32-v7a`、`linux-arm32-v6`、
-`linux-arm32-v5`、`linux-s390x`、`linux-riscv64`、`linux-ppc64le`
+| 架构 | `uname -m` | 产物 |
+|---|---|---|
+| 64 位 x86 | `x86_64` / `x64` / `amd64` | `linux-64` |
+| 64 位 ARM | `aarch64` / `arm64` | `linux-arm64-v8a` |
+
+只发布这两个架构。32 位 x86、ARM32、RISC-V、s390x、ppc64le 及 MIPS 均不提供产物，
+在这些机器上脚本会立即报「不支持的 CPU 架构」并退出，不会改动系统上的任何东西。
 
 ### 分发端点与密钥
 

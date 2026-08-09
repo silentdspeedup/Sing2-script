@@ -91,17 +91,14 @@ esac
 
 # ---------- 架构识别 ----------
 # 取值必须与发布产物的文件名一致。
+#
+# ⚠ 这张表和发布侧的构建矩阵是同一张表的两半，增删架构必须两边同一批改。
+# 只改这边（留下一个没有产物的分支）不会报「不支持的架构」——它会一路走到下载，
+# 撞上一个和「密钥错」「版本不存在」完全无法区分的 404，于是没人会想到去查架构。
 detect_arch() {
     case "$(uname -m)" in
         x86_64 | x64 | amd64)   echo "linux-64" ;;
         aarch64 | arm64)        echo "linux-arm64-v8a" ;;
-        armv7l | armv7)         echo "linux-arm32-v7a" ;;
-        armv6l)                 echo "linux-arm32-v6" ;;
-        armv5tel | armv5)       echo "linux-arm32-v5" ;;
-        s390x)                  echo "linux-s390x" ;;
-        riscv64)                echo "linux-riscv64" ;;
-        ppc64le)                echo "linux-ppc64le" ;;
-        i386 | i686)            echo "linux-32" ;;
         *)                      echo "" ;;
     esac
 }
