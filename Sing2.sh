@@ -802,6 +802,8 @@ EOF
       DeviceLimit: 0 # 0 = 不限
       RuleListPath: # ${CONF_DIR}/rulelist
     ControllerConfig:
+      # 0.0.0.0 只监听 IPv4。有 IPv6 直连用户请写 "::"（双栈），
+      # 否则那部分用户连不上，而节点本身一切正常、日志也不会提示。
       ListenIP: 0.0.0.0
       SendIP: 0.0.0.0
       UpdatePeriodic: 60
