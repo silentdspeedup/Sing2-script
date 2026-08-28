@@ -521,12 +521,58 @@ ${error}
 EOF
     chmod 644 /etc/logrotate.d/Sing2
 
-    # 语法自检：写坏了会让**系统全部**日志轮转任务一起失败，不能只写不验。
+    # ⚠ 沙箱豁免。发行版的 logrotate.service 普遍带 systemd 加固，Debian/Ubuntu 上
+    # 是 ProtectSystem=full —— 它把 /etc 挂成**只读**。而我们的日志出厂就放在
+    # /etc/Sing2/ 下，于是 logrotate 每天准时启动、准时失败：
+    #     error: error opening /etc/Sing2/access.log: Read-only file system
+    # 真实后果：某节点 9 个月一次没轮转成功，access.log 涨到 6.92 GB。
+    #
+    # ⚠ 这个坑之所以能活这么久，是因为下面那句自检**跑在沙箱外**：`logrotate -d`
+    # 以 root 直接执行，/etc 可写，当然通过，然后打印「日志轮转已配置」。验证没有
+    # 复现执行环境，绿色就什么都不证明。所以下面把自检从"配置能不能解析"换成
+    # "在真实执行环境里跑一次看它成不成"。
+    #
+    # 逐目录授权而不是整个关掉 ProtectSystem：只放开我们确实要写的那两个目录。
+    if systemctl cat logrotate.service >/dev/null 2>&1; then
+        local d1 d2 rwdirs
+        d1=$(dirname "$access")
+        d2=$(dirname "$error")
+        if [[ "$d1" == "$d2" ]]; then rwdirs="$d1"; else rwdirs="$d1 $d2"; fi
+        mkdir -p /etc/systemd/system/logrotate.service.d
+        cat > /etc/systemd/system/logrotate.service.d/sing2.conf <<EOF
+# 由 Sing2 安装脚本生成。发行版的 logrotate.service 用 ProtectSystem 把 /etc 挂成
+# 只读，而 Sing2 的日志默认在 /etc/Sing2/ 下；不放开这两个目录，轮转会静默失败。
+[Service]
+ReadWritePaths=${rwdirs}
+EOF
+        systemctl daemon-reload >/dev/null 2>&1
+    fi
+
+    # 自检一：语法。写坏了会让**系统全部**日志轮转任务一起失败，不能只写不验。
     if ! logrotate -d /etc/logrotate.d/Sing2 >/dev/null 2>&1; then
         echo -e "${red}logrotate 配置自检未通过${plain}，已删除以免影响系统其它轮转任务："
         logrotate -d /etc/logrotate.d/Sing2 2>&1 | sed 's/^/  /' | head -10
         rm -f /etc/logrotate.d/Sing2
         return 0
+    fi
+
+    # 自检二：**在真实执行环境里**跑一次。
+    #
+    # 上面那句 `logrotate -d` 以 root 直接执行，不带任何沙箱，所以它只能回答
+    # 「配置能不能解析」，回答不了「systemd 叫起 logrotate 时它能不能写这些文件」。
+    # 这两个问题的答案曾经差了 9 个月：配置一直是对的，而每天的真实执行一直在
+    # 报 Read-only file system，没人看见。
+    #
+    # 这里用同样的加固参数起一个一次性单元来复现那个环境。ExecStart 只做一次
+    # touch —— 要验的就是「能不能在这些目录里写」，不需要真的轮转。
+    if command -v systemd-run >/dev/null 2>&1 && [[ -n "${rwdirs:-}" ]]; then
+        local probe="${d1}/.sing2-rotate-probe"
+        if ! systemd-run --quiet --wait --collect                 -p ProtectSystem=full -p ReadWritePaths="${rwdirs}"                 /bin/sh -c "touch '${probe}' && rm -f '${probe}'" >/dev/null 2>&1; then
+            echo -e "${yellow}日志轮转可能无法写入${plain} ${access%/*}"
+            echo -e "  发行版的 logrotate.service 带 systemd 加固（多为 ProtectSystem=full），"
+            echo -e "  它会把 /etc 挂成只读；本脚本已写入豁免，但这台机器上仍然写不进去。"
+            echo -e "  请手动确认：${yellow}systemctl cat logrotate.service | grep ProtectSystem${plain}"
+        fi
     fi
 
     # 配置能解析 ≠ 会被执行。没有驱动就别报喜——那句「已配置」会让运维不再管这件事，
