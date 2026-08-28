@@ -659,6 +659,17 @@ install_Sing2() {
         last_version=$1
         # release tag 一律带 v 前缀，允许用户少打这个 v（0.0.2 → v0.0.2）。
         [[ "$last_version" =~ ^[0-9] ]] && last_version="v${last_version}"
+        # 形状校验必须在这里做，因为**下游做不了**：分发端点对「密钥错误」与
+        # 「版本不存在」返回同一个 404（见下面获取 latest 失败时的提示），所以一旦
+        # 拼进 URL 发出去，回来的 404 就再也分不清是打错了版本号还是密钥有问题。
+        # 真实踩过：在菜单里被问「输入指定版本」时顺手输了菜单序号 2，拼成 v2，
+        # 得到一个指向密钥的 404，而密钥其实是好的。
+        if [[ ! "$last_version" =~ ^v[0-9]+\.[0-9]+\.[0-9]+ ]]; then
+            echo -e "${red}版本号格式不对：${plain}${last_version}"
+            echo -e "  版本号形如 ${yellow}v0.4.0${plain}（三段），留空则自动取最新版。"
+            echo -e "  ${yellow}提示：如果你刚才输的是菜单序号，请重来一次并在版本那一步直接回车。${plain}"
+            exit 1
+        fi
         echo -e "开始安装 Sing2 ${green}${last_version}${plain}"
     fi
 
