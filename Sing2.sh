@@ -615,16 +615,39 @@ show_logrotate_status() {
     fi
     echo -e "日志轮转: ${green}已配置${plain}，由 ${green}${driver}${plain} 触发"
 
-    # 上次轮转时间。状态文件路径按发行版不同，两处都看。没有记录说明还没轮转过
-    # ——刚装的机器就是这样，不是故障。
+    # ⚠ 状态文件里的日期**不是**「上次轮转成功」的证据。
+    #
+    # logrotate 首次见到一个文件时会记下当前时间而**不轮转**（它没有基线可比），
+    # 之后每次处理也会更新这个日期——包括轮转因为写不进目录而失败的那些次。
+    # 这里原本把它直接标成「上次轮转」，于是产生了本项目最不该有的那种信号：
+    # 界面显示「已配置，上次轮转 2026-9-1 0:0:2」，而同一个目录里
+    # access.log 是 5.8 GB、一个 .gz 都没有。运维照着这行字判断「轮转正常」，
+    # 真相是它一次都没成功过。
+    #
+    # 唯一可信的证据是**磁盘上有没有轮转产物**，所以下面先数产物、再报日期，
+    # 并且在「有日期但没产物」时明确报警——那正是失败的形状。
+    local logdir="${CONF_DIR}"
+    local n_rotated
+    n_rotated=$(ls -1 "${logdir}"/access.log-* "${logdir}"/access.log.[0-9]* 2>/dev/null | wc -l)
+
     local state last
     for state in /var/lib/logrotate/status /var/lib/logrotate.status; do
         [[ -f "$state" ]] || continue
         last=$(grep -F "${CONF_DIR}/access.log" "$state" 2>/dev/null | tail -1 | awk '{print $2}')
         [[ -n "$last" ]] && break
     done
-    if [[ -n "$last" ]]; then
-        echo -e "          access.log 上次轮转: ${green}${last}${plain}"
+
+    if [[ "$n_rotated" -gt 0 ]]; then
+        echo -e "          access.log 轮转产物: ${green}${n_rotated} 份${plain}${last:+（logrotate 上次处理: ${last}）}"
+    elif [[ -n "$last" ]]; then
+        local sz=""
+        [[ -f "${logdir}/access.log" ]] && sz=$(du -h "${logdir}/access.log" 2>/dev/null | awk '{print $1}')
+        echo -e "          ${red}轮转从未成功${plain}：logrotate 上次处理于 ${yellow}${last}${plain}，"
+        echo -e "          但 ${logdir} 下没有任何轮转产物${sz:+（access.log 当前 ${red}${sz}${plain}）}"
+        echo -e "          排查（${yellow}别用 logrotate -d${plain}，它不带沙箱、永远通过）："
+        echo -e "            ${green}systemctl start logrotate.service && journalctl -u logrotate.service -n 25${plain}"
+        echo -e "          最常见的原因是发行版给 logrotate.service 加了 ${yellow}ProtectSystem${plain}，"
+        echo -e "          把 /etc 挂成只读，而日志就在 ${logdir} 下。修：${green}sing2 update${plain}（会补写豁免）"
     else
         echo -e "          ${yellow}尚无轮转记录${plain}（刚安装时正常，首次触发后才会有）"
     fi
