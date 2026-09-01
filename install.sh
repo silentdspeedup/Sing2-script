@@ -669,12 +669,25 @@ install_manager() {
 }
 
 # 已安装版本。以二进制自报为准而不是记在某个文件里——文件会和实际装的东西脱节。
-# `sing2 version` 打印 "sing2 v0.0.2"；本地 make build 出来的是 "dev"，
-# 那种情况当作未知，照常重装。
+# 本地 make build 出来的是 "dev"，那种情况当作未知，照常重装。
+#
+# ⚠ 只取**第一行**。`sing2 version` 现在是多行的：
+#
+#     sing2 v0.6.0
+#     core  v1.13.18-extended-2.6.5-sing2.9
+#
+# 原来写的是 `awk '{print $2}'`——那会对**每一行**都打印第二个字段，于是 $v 变成
+# 两行，和单行的 latest 永远不相等，「同版本不重装」那条分支从来走不到。
+# 结果是升级到最新版之后再跑 `sing2 update` 依然会完整重装一遍。
+#
+# 这条 awk 写于 2026-07-25，当时 `version` 只有一行、完全正确；2026-08-14 Sing2
+# 那边给它加了 core 行（心跳要上报基座版本，Sing2 issue #25），两个仓库之间没有
+# 任何门禁，于是这里静默失效了半个月。Sing2 侧现已补上格式门禁
+# （cmd/sing2/version_contract_test.go），改那行输出会让它变红。
 installed_version() {
     [[ -x "${INSTALL_DIR}/sing2" ]] || return 1
     local v
-    v=$("${INSTALL_DIR}/sing2" version 2>/dev/null | awk '{print $2}')
+    v=$("${INSTALL_DIR}/sing2" version 2>/dev/null | awk 'NR==1{print $2}')
     [[ -n "$v" && "$v" != "dev" ]] || return 1
     echo "$v"
 }
