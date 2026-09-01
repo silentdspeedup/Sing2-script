@@ -615,6 +615,19 @@ show_logrotate_status() {
     fi
     echo -e "日志轮转: ${green}已配置${plain}，由 ${green}${driver}${plain} 触发"
 
+    # 沙箱豁免。这一条是**预测性**的：不用等一天，装完就能判。
+    #
+    # 发行版的 logrotate.service 普遍带 ProtectSystem=full，它把 /etc 挂成只读，
+    # 而 Sing2 的日志出厂就在 /etc/Sing2/ 下。没有豁免时 logrotate 每天准时启动、
+    # 准时报 `Read-only file system`，而**状态文件的日期照样往前推**——所以下面
+    # 那条「有没有产物」的检查要等到第二天才看得出来，这条现在就能看出来。
+    if systemctl cat logrotate.service 2>/dev/null | grep -q '^ProtectSystem=' &&
+       ! systemctl cat logrotate.service 2>/dev/null | grep -q "ReadWritePaths=.*${CONF_DIR}"; then
+        echo -e "          ${red}缺少沙箱豁免${plain}：logrotate.service 带 ${yellow}ProtectSystem${plain}，"
+        echo -e "          它把 /etc 挂成只读，而日志在 ${CONF_DIR} 下——轮转会每天失败。"
+        echo -e "          修：${green}sing2 update${plain}（会补写 ReadWritePaths 豁免）"
+    fi
+
     # ⚠ 状态文件里的日期**不是**「上次轮转成功」的证据。
     #
     # logrotate 首次见到一个文件时会记下当前时间而**不轮转**（它没有基线可比），
