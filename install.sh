@@ -11,6 +11,7 @@
 # 布局：
 #   /usr/local/Sing2/sing2        二进制
 #   /etc/Sing2/config.yml         配置（升级不覆盖）
+#   /etc/Sing2/config.yml.example 最新配置模板（每次安装/升级覆盖刷新，仅供对照）
 #   /etc/Sing2/dist_base          分发端点（600）
 #   /etc/Sing2/dist_key           分发密钥（600）
 #   /usr/bin/sing2                管理脚本（sing2 / Sing2 大小写均可）
@@ -828,6 +829,25 @@ install_Sing2() {
 
     install_manager
 
+    # 配置模板：每次安装/升级都把随包的那份刷到 config.yml.example。
+    #
+    # 为什么需要它，而不是「看 /etc/Sing2/config.yml 就行」——那句话**只在全新安装
+    # 那一刻成立**，之后两条路都会让它失真：
+    #   1. 升级刻意不覆盖 config.yml（覆盖就是把运维填的面板地址、ApiKey 抹掉），
+    #      所以跑了半年的节点上那份注释停留在当初装的版本；
+    #   2. `sing2 generate` 向导会把 config.yml **整份换掉**（旧的存成 .bak），
+    #      而向导是脚本内联 heredoc 生成的，几乎一行注释都没有。
+    # 于是「带注释的完整示例」在真实节点上既不是最新的、也可能根本不存在了。
+    #
+    # ⚠ 覆盖的是 .example，**永远不碰 config.yml**。这两个名字的差别是这段代码唯一
+    # 危险的地方：写错一个字就是把生产配置抹掉，而且是在升级路径上、静默发生。
+    if [[ -f "${tmp}/unpacked/config.yml" ]]; then
+        cp -f "${tmp}/unpacked/config.yml" "${CONF_DIR}/config.yml.example"
+        # 644 而不是 config.yml 的 600：模板里没有任何密钥，出厂值全是占位符，
+        # 而它存在的理由就是被随手 diff。
+        chmod 644 "${CONF_DIR}/config.yml.example" 2>/dev/null
+    fi
+
     # 配置：全新安装才铺示例，升级绝不覆盖
     if [[ ! -f "${CONF_DIR}/config.yml" ]]; then
         if [[ -f "${tmp}/unpacked/config.yml" ]]; then
@@ -839,6 +859,10 @@ install_Sing2() {
         echo -e "${yellow}可执行 ${green}sing2 config${yellow} 编辑，或 ${green}sing2 generate${yellow} 用向导生成${plain}"
     else
         echo -e "检测到已有配置，保留 ${CONF_DIR}/config.yml 不动"
+        if [[ -f "${CONF_DIR}/config.yml.example" ]]; then
+            echo -e "本版配置模板已刷新到 ${green}${CONF_DIR}/config.yml.example${plain}（新增项、注释变化都在里面）"
+            echo -e "  对照命令：${green}diff ${CONF_DIR}/config.yml ${CONF_DIR}/config.yml.example${plain}"
+        fi
         systemctl start Sing2
         sleep 2
         if check_status; then

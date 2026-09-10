@@ -95,6 +95,7 @@ sing2 version      查看版本
 |---|---|
 | `/usr/local/Sing2/sing2` | 二进制 |
 | `/etc/Sing2/config.yml` | 配置文件（升级不覆盖，权限 600） |
+| `/etc/Sing2/config.yml.example` | 当前版本的配置模板，**每次安装/升级刷新**，仅供对照 |
 | `/etc/Sing2/dist_base` | 分发端点（权限 600） |
 | `/etc/Sing2/dist_key` | 分发密钥（权限 600） |
 | `/etc/systemd/system/Sing2.service` | systemd 单元 |
@@ -109,7 +110,17 @@ sing2 version      查看版本
 
 ## 配置
 
-安装后 `/etc/Sing2/config.yml` 本身就是带完整注释的示例，逐字段说明都写在注释里。
+带完整注释、逐字段说明的模板是 `/etc/Sing2/config.yml.example`，**每次安装和升级都会刷新**到当前版本。
+
+想知道新版加了什么、哪条注释变了：
+
+```bash
+diff /etc/Sing2/config.yml /etc/Sing2/config.yml.example
+```
+
+> 为什么不直接看 `/etc/Sing2/config.yml`：那份是你自己的配置，升级**刻意不覆盖**它（否则面板地址、
+> ApiKey 会被抹掉），所以它的注释停留在你当初安装的那个版本；而 `sing2 generate` 向导会把它整份
+> 重新生成，那份**不带注释**。`.example` 是那份始终最新、且可以随便看随便改的参考。
 
 ```bash
 sing2 config      # 编辑（保存后自动重启）

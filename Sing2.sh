@@ -895,6 +895,12 @@ EOF
 
     chmod 600 "${CONF}"
     echo -e "${green}配置已生成：${CONF}${plain}"
+    # 向导生成的这份**几乎没有注释**（它是上面那段 heredoc 拼出来的），而它刚刚把
+    # 安装时铺下来的那份带注释的配置整个换掉了。所以这里必须指一下模板在哪，
+    # 否则运维再想看某个键是干什么的、有哪些取值，节点上已经没有地方可查了。
+    if [[ -f "${CONF_DIR}/config.yml.example" ]]; then
+        echo -e "${yellow}注意：向导生成的配置不带注释。${plain}完整注释版模板在 ${green}${CONF_DIR}/config.yml.example${plain}"
+    fi
     if [[ "$EnableREALITY" == "true" && -n "$RealityPrivKey" ]]; then
         echo -e "${yellow}提醒：REALITY 私钥只在本节点，面板只需填公钥。${plain}"
     fi
