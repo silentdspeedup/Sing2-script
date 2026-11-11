@@ -7,6 +7,7 @@
 #   /usr/local/Sing2/sing2   二进制
 #   /etc/Sing2/config.yml    配置
 #   Sing2.service            systemd 单元
+#   Sing2.service.d/memlimit.conf  内存软上限（只在设置过时存在）
 
 red='\033[0;31m'
 green='\033[0;32m'
@@ -21,6 +22,14 @@ CONF="${CONF_DIR}/config.yml"
 DIST_BASE_FILE="${CONF_DIR}/dist_base"
 DIST_KEY_FILE="${CONF_DIR}/dist_key"
 SERVICE="Sing2"
+# 内存软上限写在 drop-in 里而不是 Sing2.service 本身：升级会整份重写 unit，
+# drop-in 不受影响。同目录下运维自己放的其它 drop-in 一概不碰。
+MEMLIMIT_DIR="/etc/systemd/system/${SERVICE}.service.d"
+MEMLIMIT_FILE="${MEMLIMIT_DIR}/memlimit.conf"
+MEMLIMIT_WARNED=0
+# 本脚本会直接运行 Go 二进制（version、x25519），也会把环境传给 install.sh。调用者
+# shell 里一个写坏的 GOMEMLIMIT 会让二进制一启动就退出；服务自己的值只来自 drop-in。
+unset GOMEMLIMIT
 
 [[ $EUID -ne 0 ]] && echo -e "${red}错误：${plain} 必须以 root 运行此脚本\n" && exit 1
 
@@ -53,12 +62,15 @@ confirm() {
     [[ x"${temp}" == x"y" || x"${temp}" == x"Y" ]] && return 0 || return 1
 }
 
+# confirm_restart [默认答案 y|n] [0] —— 问过再重启。默认答案不写就是 y。第二个参数 0
+# 表示命令行调用：重启后不进菜单，答「否」也只留一句提示。
 confirm_restart() {
-    confirm "是否重启 Sing2" "y"
+    confirm "是否重启 Sing2" "${1:-y}"
     if [[ $? == 0 ]]; then
-        restart
+        if [[ $# -gt 1 ]]; then restart 0; else restart; fi
     else
-        show_menu
+        echo -e "未重启：执行 ${green}sing2 restart${plain} 后生效"
+        [[ $# -gt 1 ]] || show_menu
     fi
 }
 
@@ -205,6 +217,13 @@ uninstall() {
     systemctl stop ${SERVICE}
     systemctl disable ${SERVICE}
     rm -f /etc/systemd/system/${SERVICE}.service
+    # 内存软上限：只删本脚本写的那一份；目录里还有运维自己的 drop-in 就留着目录。
+    # memlimit.conf 里有不是本脚本写的内容时连它一起留着——那是运维自己的设置。
+    if memlimit_foreign; then
+        echo -e "${yellow}保留了 ${MEMLIMIT_FILE}${plain}：里面有不是本脚本写的内容，不需要了请自行删除"
+    else
+        memlimit_drop
+    fi
     systemctl daemon-reload
     systemctl reset-failed
     rm -rf /usr/local/Sing2/
@@ -537,6 +556,15 @@ diagnose_missing_unit() {
     else
         echo -e "  /etc/systemd/system/${SERVICE}.service ${yellow}不存在${plain} —— 安装没有完成。"
     fi
+    # drop-in 里任何一个文件 PID 1 读不了，systemd 同样会把整个 unit 记成 bad。
+    # 本脚本自己的 memlimit.conf 在 check_install 里已经修过，剩下的只列出来。
+    if [[ -d "$MEMLIMIT_DIR" ]]; then
+        echo
+        echo -e "  drop-in 目录（其中任何一个文件的 SELinux 上下文不对，systemd 都会不认整个 unit）："
+        # 目录本身 + 其中每个文件（含隐藏文件），各带 SELinux 上下文。
+        find "$MEMLIMIT_DIR" -maxdepth 1 -printf '%Z %p\n' 2>/dev/null | sed 's/^/    /'
+        echo -e "    → 不是本脚本写的文件请自行检查，例如 ${green}restorecon -v <文件>${plain}"
+    fi
     echo
     echo -e "  ${green}重装即可修复：${plain}sing2 install"
     echo -e "  （配置 ${CONF_DIR}/config.yml 会保留）"
@@ -560,6 +588,7 @@ check_uninstall() {
 }
 
 check_install() {
+    memlimit_heal
     check_status
     if [[ $? == 2 ]]; then
         echo ""
@@ -576,11 +605,13 @@ show_status() {
         0)
             echo -e "Sing2 状态: ${green}已运行${plain}"
             show_enable_status
+            show_memlimit_status
             show_logrotate_status
             ;;
         1)
             echo -e "Sing2 状态: ${yellow}未运行${plain}"
             show_enable_status
+            show_memlimit_status
             show_logrotate_status
             ;;
         2) echo -e "Sing2 状态: ${red}未安装${plain}" ;;
@@ -673,6 +704,593 @@ show_enable_status() {
     else
         echo -e "是否开机自启: ${red}否${plain}"
     fi
+}
+
+# ---------- 内存软上限（GOMEMLIMIT） ----------
+# 默认不设，也不会自动设——只在运维明确要求时写一个 drop-in。
+# install.sh 里有同名函数，取值规则必须一致；改一边就改两边。
+
+# memlimit_bytes VALUE —— 按 Go 运行时的语法换算成字节数并输出；不合法返回 1。
+#
+# Go 的语法：正整数 + 可选单位 B / KiB / MiB / GiB / TiB，区分大小写，不写单位就是
+# 字节（Go 源码 runtime/string.go 的 parseByteCount）。这里只收它的一个子集：不收 0、
+# 不收正负号、不收前导零，乘出来超过 int64 的 Go 也不收。
+#
+# ⚠ 只能比 Go 严，不能比它松：Go 遇到写错的 GOMEMLIMIT 不是忽略，而是一启动就退出
+# （malformed GOMEMLIMIT），systemd 每 10 秒拉起一次、每次都一样——节点就停在那里。
+memlimit_bytes() {
+    local re='^([1-9][0-9]{0,17})(B|KiB|MiB|GiB|TiB)?$' num mult
+    [[ "$1" =~ $re ]] || return 1
+    num=${BASH_REMATCH[1]}
+    case "${BASH_REMATCH[2]}" in
+        KiB) mult=1024 ;;
+        MiB) mult=1048576 ;;
+        GiB) mult=1073741824 ;;
+        TiB) mult=1099511627776 ;;
+        *)   mult=1 ;;
+    esac
+    # 最多 18 位，这一步的除法与下面的乘法都不会溢出。
+    (( num <= 9223372036854775807 / mult )) || return 1
+    echo $(( num * mult ))
+}
+
+# 只去首尾空白（粘贴常带进空格或回车）。中间的空白不能删：「1 2」删成「12」就成了 12 字节。
+memlimit_trim() {
+    printf '%s' "$1" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//'
+}
+
+# memlimit_human BYTES —— 人看的大小：「1500 字节」「512 MiB」「约 1.46 GiB」。
+memlimit_human() {
+    local b=$1
+    if (( b < 1048576 )); then
+        printf '%s 字节' "$b"
+    elif (( b < 1073741824 )); then
+        (( b % 1048576 == 0 )) || printf '约 '
+        printf '%s MiB' $(( b / 1048576 ))
+    elif (( b % 1073741824 == 0 )); then
+        printf '%s GiB' $(( b / 1073741824 ))
+    else
+        printf '约 %s.%02d GiB' $(( b / 1073741824 )) $(( b % 1073741824 * 100 / 1073741824 ))
+    fi
+}
+
+# memlimit_show_value VALUE —— 显示用：值本身，括号里补上人看的大小。不写单位的值是
+# 字节，一律注明——「1500」最容易被读成 1500 MiB。与值本身一样（2GiB）时不重复。
+memlimit_show_value() {
+    local v=$1 b h hs
+    if ! b=$(memlimit_bytes "$v"); then
+        printf '%s' "$v"
+        return 0
+    fi
+    h=$(memlimit_human "$b")
+    [[ "$h" == 约* ]] || h="＝${h}"
+    hs=${h#＝}
+    if [[ "$v" =~ ^[0-9]+B?$ ]]; then
+        if (( b < 1048576 )); then
+            printf '%s（%s）' "$v" "$h"
+        else
+            printf '%s（字节，%s）' "$v" "$h"
+        fi
+    elif [[ "${hs// /}" == "$v" ]]; then
+        printf '%s' "$v"
+    else
+        printf '%s（%s）' "$v" "$h"
+    fi
+}
+
+memlimit_refuse() {
+    # 用 printf %q 原样显示被拒的值：它是运维敲进来的，不能让 echo -e 去解释里面的反斜杠，
+    # 看不见的字符（中间夹的回车、全角数字）也要显出来。
+    printf '%b不认识的取值：%b%q —— 未做任何改动\n' "$red" "$plain" "$1"
+    echo -e "  写法：正整数加单位，单位只能是 ${green}B、KiB、MiB、GiB、TiB${plain}（区分大小写，不写单位就是字节）"
+    echo -e "  例如 ${green}1500MiB${plain}、${green}2GiB${plain}；不支持小数（1.5GiB 请写 1536MiB），也不认 M、G、MB、GB"
+    echo -e "  取消上限：${green}off${plain}"
+}
+
+# Sing2 进程的 PID；没在跑返回 1。不用 `show --value`：CentOS 7 的 systemd 219 没有它。
+memlimit_main_pid() {
+    local pid
+    pid=$(systemctl show -p MainPID ${SERVICE} 2>/dev/null | cut -d= -f2)
+    [[ "$pid" =~ ^[1-9][0-9]*$ && -r "/proc/${pid}/environ" ]] || return 1
+    echo "$pid"
+}
+
+# memlimit_pick —— 从 stdin 的 Environment= 行里取 GOMEMLIMIT 的值，多个以最后一个为准
+# （与 systemd 相同）。只认完整的变量名：MY_GOMEMLIMIT=5 不算。双引号括起来的一整项是
+# 一个变量（systemctl show 也这样打印带空格的值）："GOMEMLIMIT=1500MiB GOGC=50" 取出
+# 「1500MiB GOGC=50」——systemd 交给 Go 的正是它，Go 不认。
+memlimit_pick() {
+    local v
+    v=$(sed -n 's/^[[:space:]]*Environment=//p' |
+        grep -oE '"([^"\\]|\\.)*"|[^"[:space:]]+' | grep -E '^"?GOMEMLIMIT=' | tail -1)
+    v=${v#*GOMEMLIMIT=}
+    v=${v%\"}
+    [[ -n "$v" ]] || return 1
+    printf '%s\n' "$v"
+}
+
+# 三个「当前值」，各答一个问题：
+#   configured —— 本脚本的 drop-in 里写的
+#   effective  —— systemd 下次启动时会给的（所有 drop-in 叠加后的结果）
+#   running    —— 正在跑的进程启动时拿到的
+# 三者可能不同：写了没重启、或者运维自己另有 drop-in 也设了它。
+memlimit_configured() {
+    [[ -f "$MEMLIMIT_FILE" ]] || return 1
+    memlimit_pick < "$MEMLIMIT_FILE"
+}
+
+memlimit_effective() {
+    systemctl show -p Environment ${SERVICE} 2>/dev/null | memlimit_pick
+}
+
+# systemd 手里的配置比磁盘上的旧：文件改过，之后没有成功的 daemon-reload。这时
+# effective 与 configured 不同，原因不在别的 drop-in。
+memlimit_stale() {
+    [[ "$(systemctl show -p NeedDaemonReload ${SERVICE} 2>/dev/null)" == "NeedDaemonReload=yes" ]]
+}
+
+memlimit_running() {
+    local pid=$1 v
+    v=$(tr '\0' '\n' < "/proc/${pid}/environ" 2>/dev/null | grep -E '^GOMEMLIMIT=' | tail -1)
+    v=${v#GOMEMLIMIT=}
+    [[ -n "$v" ]] || return 1
+    echo "$v"
+}
+
+# 进程在跑、且它拿到的值和 systemd 现在会给的不一样 —— 重启后才会生效。
+memlimit_pending() {
+    local pid want have
+    pid=$(memlimit_main_pid) || return 1
+    want=$(memlimit_effective) || want=""
+    have=$(memlimit_running "$pid") || have=""
+    [[ "$want" != "$have" ]]
+}
+
+# memlimit_warn VALUE BYTES —— 只提醒、不拒绝：这几种值 Go 都收，只是多半不是运维想要的。
+# 返回提醒的条数（0 = 没有）；有提醒时，「是否重启」的默认答案改成 n。
+memlimit_warn() {
+    local v=$1 bytes=$2 n=0 total pid rss
+    if [[ "$v" =~ ^[0-9]+B?$ ]]; then
+        if [[ "$v" == *B ]]; then
+            printf '%b注意：%s 的 B 就是字节%b' "$yellow" "$v" "$plain"
+        else
+            printf '%b注意：%s 没写单位，按字节算%b' "$yellow" "$v" "$plain"
+        fi
+        printf '＝%s 字节（约 %s MiB）' "$bytes" $(( bytes / 1048576 ))
+        (( bytes < 1048576 )) && printf '；想要 MiB 请写 %sMiB' "${v%B}"
+        printf '\n'
+        n=$(( n + 1 ))
+    fi
+    if (( bytes < 268435456 )); then
+        echo -e "${yellow}注意：低于 256MiB${plain}——上限太低时 Go 会频繁回收内存，CPU 明显升高。"
+        n=$(( n + 1 ))
+    fi
+    total=$(awk '/^MemTotal:/{print $2; exit}' /proc/meminfo 2>/dev/null)
+    if [[ "$total" =~ ^[0-9]+$ ]] && (( bytes > total * 1024 )); then
+        echo -e "${yellow}注意：高于本机内存总量${plain}（MemTotal 约 $(( total / 1024 )) MiB）——内存用光之前到不了这个上限，等于没设。"
+        n=$(( n + 1 ))
+    fi
+    # RSS 不是下限：它还含着没回收的垃圾，而压掉垃圾正是软上限的用处。只有远低于它
+    # （不到一半）时，才多半连正在用的数据都装不下。
+    if pid=$(memlimit_main_pid); then
+        rss=$(awk '/^VmRSS:/{print $2; exit}' "/proc/${pid}/status" 2>/dev/null)
+        if [[ "$rss" =~ ^[0-9]+$ ]] && (( bytes < rss * 512 )); then
+            echo -e "${yellow}注意：不到 Sing2 现在内存占用的一半${plain}（RSS 约 $(( rss / 1024 )) MiB）——这么低多半连正在用的数据都装不下：回收会一直跑、CPU 升高，内存也降不下来。"
+            n=$(( n + 1 ))
+        elif [[ "$rss" =~ ^[0-9]+$ ]] && (( bytes < rss * 1024 )); then
+            echo -e "${yellow}注意：低于 Sing2 现在的内存占用${plain}（RSS 约 $(( rss / 1024 )) MiB）。"
+            echo -e "  其中多少是还没回收的垃圾，从外面看不出来：压的是垃圾，正是软上限的用处；压到正在用的数据，回收就会一直跑、CPU 升高。重启后观察几分钟 CPU 与内存。"
+            n=$(( n + 1 ))
+        fi
+    fi
+    return "$n"
+}
+
+# memlimit_relabel PATH —— 把这一个路径（不递归）打回 systemd 该有的 SELinux 标签。
+# 标签不对的 drop-in（典型是从 /tmp mv 进来的文件）PID 1 读不了，会让 systemd 把整个
+# Sing2.service 记成 bad。类型真的变了返回 0（调用方该 daemon-reload），否则返回 1。
+# 非 SELinux 系统上两条命令不存在或无害，类型读出来前后一样。
+memlimit_relabel() {
+    local p=$1 before
+    [[ -e "$p" ]] || return 1
+    before=$(stat -c %C "$p" 2>/dev/null | cut -d: -f3)
+    if command -v restorecon >/dev/null 2>&1; then
+        restorecon -F "$p" >/dev/null 2>&1
+    elif command -v chcon >/dev/null 2>&1; then
+        chcon -t systemd_unit_file_t "$p" >/dev/null 2>&1
+    fi
+    [[ "$(stat -c %C "$p" 2>/dev/null | cut -d: -f3)" != "$before" ]]
+}
+
+# 写到一半被中断（Ctrl-C、kill）留下的临时文件只会是这个名字；不清掉，目录就删不掉。
+memlimit_clean_tmp() {
+    rm -f -- "$MEMLIMIT_DIR"/.memlimit.conf.??????
+}
+
+# memlimit_content VALUE —— memlimit.conf 的完整内容（ASCII，由 PID 1 解析）。
+# 写入与「文件还是不是本脚本写的样子」的比对共用这一份。
+memlimit_content() {
+    printf '%s\n' \
+        "# Written by the Sing2 manager script. Change it with: sing2 memlimit <value>" \
+        "# Remove it with: sing2 memlimit off. A soft limit, not a hard cap." \
+        "[Service]" \
+        "Environment=GOMEMLIMIT=$1"
+}
+
+# memlimit_intact VALUE —— 文件逐字节就是 memlimit_write VALUE 会写的内容。手改丢了
+# [Service]、换成了 CRLF、多了别的行，都算不一样。没有 cmp 时一律算不一样：多重写
+# 一次无害。
+memlimit_intact() {
+    memlimit_content "$1" | cmp -s - "$MEMLIMIT_FILE" 2>/dev/null
+}
+
+# memlimit_foreign —— memlimit.conf 在，而里面有本脚本不会写的东西时返回 0。逐行看（去掉
+# 行尾的 CR 和首尾空白），只认：空行、注释（# 或 ;）、[Service]、只设 GOMEMLIMIT 一个变量的
+# Environment=GOMEMLIMIT=<值> 或 Environment="GOMEMLIMIT=<值>"（<值> 不含空白和引号，就是
+# memlimit_pick 读得出来的写法）。同一行多一个变量、MemoryMax= 之类的其它设置、清空列表的
+# Environment=……都是运维自己写进来的：整份重写或删掉这个文件，就把它们一起丢了。
+# 不是普通文件或读不了，也算。第一行开头的 UTF-8 BOM（Windows 编辑器常加）systemd 会跳过，
+# 这里也跳过。
+memlimit_foreign() {
+    local line t bom=$'\xef\xbb\xbf'
+    [[ -e "$MEMLIMIT_FILE" ]] || return 1
+    [[ -f "$MEMLIMIT_FILE" && -r "$MEMLIMIT_FILE" ]] || return 0
+    while IFS= read -r line || [[ -n "$line" ]]; do
+        line=${line#"$bom"}; bom=""
+        line=${line%$'\r'}
+        line=${line#"${line%%[![:space:]]*}"}
+        line=${line%"${line##*[![:space:]]}"}
+        case "$line" in
+            ''|'#'*|';'*|'[Service]') continue ;;
+            'Environment="GOMEMLIMIT='*'"') t=${line#'Environment="GOMEMLIMIT='}; t=${t%'"'} ;;
+            'Environment=GOMEMLIMIT='*) t=${line#'Environment=GOMEMLIMIT='} ;;
+            *) return 0 ;;
+        esac
+        [[ -n "$t" && "$t" != *[[:space:]\"\']* ]] || return 0
+    done < "$MEMLIMIT_FILE"
+    return 1
+}
+
+# memlimit_foreign_note —— memlimit_foreign 为真时告诉运维怎么办（查看与拒绝时共用）。
+memlimit_foreign_note() {
+    echo -e "  本脚本只写 [Service] 和一行 Environment=GOMEMLIMIT=<值>，不会重写或删除别的设置。"
+    echo -e "  把它们挪到另一个 drop-in（例如 ${green}systemctl edit Sing2${plain} 写的 override.conf）之后，再设置或取消"
+}
+
+# memlimit_refuse_foreign —— 文件里有不是本脚本写的内容时说明并返回 0，调用方随即放弃：
+# 设置（同值也是）、取消都不能整份重写或删掉运维自己的设置。
+memlimit_refuse_foreign() {
+    memlimit_foreign || return 1
+    printf '%b%s 里有不是本脚本写的内容%b——未做任何改动\n' "$red" "$MEMLIMIT_FILE" "$plain"
+    memlimit_foreign_note
+    return 0
+}
+
+# memlimit_write VALUE —— 0 写好且 systemd 已重读，1 没写成（什么都没改），
+# 4 文件已写好、但 systemctl daemon-reload 失败。
+# 原子写入：同目录临时文件 → 644 → mv。临时文件建在 drop-in 目录里，SELinux 上由此
+# 继承正确的标签，relabel 是兜底；临时文件名不以 .conf 结尾，systemd 不会读到写了
+# 一半的它。
+memlimit_write() {
+    local value=$1 tmpf
+    mkdir -p "$MEMLIMIT_DIR" || return 1
+    memlimit_clean_tmp
+    tmpf=$(mktemp "${MEMLIMIT_DIR}/.memlimit.conf.XXXXXX") || { rmdir "$MEMLIMIT_DIR" 2>/dev/null; return 1; }
+    if ! memlimit_content "$value" > "$tmpf" ||
+       ! chmod 644 "$tmpf" ||
+       ! mv -f "$tmpf" "$MEMLIMIT_FILE"; then
+        rm -f "$tmpf"
+        rmdir "$MEMLIMIT_DIR" 2>/dev/null
+        return 1
+    fi
+    # 目录可能是刚建的，也打一次（同样不递归，目录里别的文件不碰）。
+    memlimit_relabel "$MEMLIMIT_DIR"
+    memlimit_relabel "$MEMLIMIT_FILE"
+    systemctl daemon-reload || return 4
+    return 0
+}
+
+# 只删本脚本的那一份（和它中断留下的临时文件）；目录空了才连目录一起删
+# （rmdir 对非空目录本来就会失败）。
+memlimit_drop() {
+    rm -f "$MEMLIMIT_FILE" || return 1
+    memlimit_clean_tmp
+    rmdir "$MEMLIMIT_DIR" 2>/dev/null
+    return 0
+}
+
+# memlimit_heal —— 本脚本的 memlimit.conf 标签不对时，systemd 把整个 Sing2.service 记成
+# bad，于是 restart、uninstall、连 sing2 memlimit off 都会被 check_install 拦下。
+# 只在 systemd 不认这个 unit 时动手，只修这一个文件（不递归、不碰别的 drop-in）。
+memlimit_heal() {
+    local st
+    check_status
+    st=$?
+    [[ $st == 2 ]] || return 0
+    memlimit_relabel "$MEMLIMIT_FILE" || return 0
+    systemctl daemon-reload
+    echo -e "${yellow}已把 ${MEMLIMIT_FILE} 的 SELinux 标签改回正确的类型${plain}，systemd 已重新读取"
+}
+
+# 「systemd 仍给着一个值」的说明，几处共用：还没重新读取，或来自别处。
+memlimit_note_other() {
+    if memlimit_stale; then
+        printf '%b注意：%bsystemd 仍给 %s 设着 GOMEMLIMIT=%s——它还没重新读取（上次 daemon-reload 没成功），修好后执行 %bsystemctl daemon-reload%b\n' \
+            "$yellow" "$plain" "$SERVICE" "$1" "$green" "$plain"
+    else
+        printf '%b注意：%bsystemd 仍给 %s 设着 GOMEMLIMIT=%s——来自另一个 drop-in 或 unit 本身，%bsystemctl cat %s%b 查看\n' \
+            "$yellow" "$plain" "$SERVICE" "$1" "$green" "$SERVICE" "$plain"
+    fi
+}
+
+# memlimit_flag_bad VALUE OWN —— 手改出来、脚本不认的值打一行红字并返回 0；值没问题
+# 什么都不打、返回 1。OWN=1：值在本脚本的文件里，用 sing2 memlimit 重写即可；OWN=2：
+# 在 memlimit.conf 里，但那个文件里有不是本脚本写的内容（本脚本不重写它）；否则在
+# 别的 drop-in 里。off 是 Go 认的写法（不设上限），不算。说「多半」：0、+N、前导零
+# 脚本不收，Go 其实收。
+memlimit_flag_bad() {
+    [[ -n "$1" && "$1" != off ]] || return 1
+    memlimit_bytes "$1" >/dev/null && return 1
+    printf '  %b%q：脚本不认这个写法（Go 多半也不认，重启后 Sing2 会起不来）%b' "$red" "$1" "$plain"
+    if [[ "$2" == 1 ]]; then
+        printf '——用 %bsing2 memlimit <值>%b 重写\n' "$green" "$plain"
+    elif [[ "$2" == 2 ]]; then
+        printf '——改好 memlimit.conf 里的这一行\n'
+    else
+        printf '——它不在本脚本的文件里，%bsystemctl cat %s%b 查看\n' "$green" "$SERVICE" "$plain"
+    fi
+    return 0
+}
+
+# set_memlimit VALUE —— 0 已改动，1 拒绝/失败（什么都没改），3 无需改动，
+# 4 systemd 没读到这次的改动（daemon-reload 失败，或重读后仍没有这个值；重启也用不上）。
+# 提醒的条数留在 MEMLIMIT_WARNED，memlimit() 据此决定「是否重启」的默认答案。
+set_memlimit() {
+    local v bytes cur want
+    MEMLIMIT_WARNED=0
+    v=$(memlimit_trim "$1")
+    if [[ "$v" == "off" ]]; then
+        if [[ ! -e "$MEMLIMIT_FILE" ]]; then
+            memlimit_drop
+            # 本脚本的文件不在，不等于没设：上次 daemon-reload 可能没成功（systemd 手里
+            # 还是旧值），运维也可能用 systemctl edit 自己设过。systemd 还给着值就先让它
+            # 重读一次，再如实说。
+            if ! want=$(memlimit_effective); then
+                echo -e "内存软上限本来就${yellow}未设置${plain}，无改动"
+                return 3
+            fi
+            if ! systemctl daemon-reload; then
+                echo -e "${yellow}本脚本没有设置内存软上限（${MEMLIMIT_FILE} 不存在），而 systemctl daemon-reload 失败${plain}"
+                memlimit_note_other "$want"
+                return 4
+            fi
+            if want=$(memlimit_effective); then
+                echo -e "本脚本没有设置内存软上限（${MEMLIMIT_FILE} 不存在），无改动"
+                memlimit_note_other "$want"
+                return 3
+            fi
+            echo -e "${green}已取消内存软上限${plain}（${MEMLIMIT_FILE} 早已删除，systemd 这次才重新读取）"
+            return 0
+        fi
+        memlimit_refuse_foreign && return 1
+        if ! memlimit_drop; then
+            echo -e "${red}删除 ${MEMLIMIT_FILE} 失败${plain}"
+            return 1
+        fi
+        if ! systemctl daemon-reload; then
+            echo -e "${yellow}已删除 ${MEMLIMIT_FILE}，但 systemctl daemon-reload 失败${plain}——systemd 还没读到这个变化，修好后执行 ${green}systemctl daemon-reload${plain}"
+            return 4
+        fi
+        echo -e "${green}已取消内存软上限${plain}（删除了 ${MEMLIMIT_FILE}）"
+        want=$(memlimit_effective) && memlimit_note_other "$want"
+        return 0
+    fi
+
+    if ! bytes=$(memlimit_bytes "$v"); then
+        memlimit_refuse "$v"
+        return 1
+    fi
+    memlimit_refuse_foreign && return 1
+    memlimit_warn "$v" "$bytes"
+    MEMLIMIT_WARNED=$?
+    cur=$(memlimit_configured) || cur=""
+    if [[ "$cur" == "$v" ]]; then
+        # 文件里已是这个值。标签不对（从别处 mv 进来）先打回来；之后 systemd 给的仍不是
+        # 它（上次 daemon-reload 没成功、文件被手改坏了），或文件已不是本脚本写的样子，
+        # 就整份重写一次——光让 systemd 重读，救不了一个丢了 [Service] 的文件。
+        memlimit_relabel "$MEMLIMIT_FILE"
+        want=$(memlimit_effective) || want=""
+        if [[ "$want" == "$v" ]] && memlimit_intact "$v"; then
+            printf '内存软上限已经是 %b%s%b，无改动\n' "$green" "$(memlimit_show_value "$v")" "$plain"
+            return 3
+        fi
+    fi
+    memlimit_write "$v"
+    case $? in
+        0) ;;
+        4)
+            printf '%b已写入 %s，但 systemctl daemon-reload 失败%b——systemd 还没读到它，修好后再执行一次 %bsing2 memlimit %s%b\n' \
+                "$yellow" "$MEMLIMIT_FILE" "$plain" "$green" "$v" "$plain"
+            return 4
+            ;;
+        *)
+            echo -e "${red}写入 ${MEMLIMIT_FILE} 失败${plain}，未做改动"
+            return 1
+            ;;
+    esac
+    if [[ "$cur" == "$v" ]]; then
+        printf '内存软上限已经是 %b%s%b，已重写 %s 并让 systemd 重新读取\n' "$green" "$(memlimit_show_value "$v")" "$plain" "$MEMLIMIT_FILE"
+    else
+        printf '%b内存软上限已设为 %s%b，写入 %s\n' "$green" "$(memlimit_show_value "$v")" "$plain" "$MEMLIMIT_FILE"
+    fi
+
+    # 写完以 systemd 自己的说法为准，和 install_unit 验 unit 是同一个道理。
+    want=$(memlimit_effective) || want=""
+    if [[ -z "$want" ]]; then
+        echo -e "${red}systemd 没有读到这个值${plain}——重启也用不上它"
+        echo -e "  SELinux：$(getenforce 2>/dev/null || echo 'N/A')"
+        echo -e "  上下文：$(ls -Z "$MEMLIMIT_FILE" 2>/dev/null)"
+        echo -e "  排查：${green}systemctl cat ${SERVICE}${plain}"
+        return 4
+    elif [[ "$want" != "$v" ]]; then
+        printf '%b注意：%bsystemd 实际会给 GOMEMLIMIT=%s——另一个排在后面的 drop-in 也设了它，\n' "$yellow" "$plain" "$want"
+        echo -e "  ${green}systemctl cat ${SERVICE}${plain} 查看"
+    fi
+    return 0
+}
+
+show_memlimit() {
+    local cur want pid have hs ws
+    if memlimit_foreign; then
+        # 不是本脚本写的文件：只说 systemd 会给什么，下面不再拿它和文件比、不出重写的主意
+        # （设置、取消都会被拒绝）。cur 取 systemd 的值，下面的比对就自然跳过。
+        cur=$(memlimit_effective) || cur=""
+        hs="未设置"; [[ -n "$cur" ]] && hs=$(memlimit_show_value "$cur")
+        printf '内存软上限（GOMEMLIMIT）：%bmemlimit.conf 里有不是本脚本写的内容%b（%s）\n' "$yellow" "$plain" "$MEMLIMIT_FILE"
+        echo -e "  systemd 现在会给：${hs}"
+        if [[ "$cur" == "$(memlimit_configured)" ]]; then memlimit_flag_bad "$cur" 2; else memlimit_flag_bad "$cur" 0; fi
+        memlimit_foreign_note
+    elif cur=$(memlimit_configured); then
+        printf '内存软上限（GOMEMLIMIT）：%b%s%b，写在 %s\n' "$green" "$(memlimit_show_value "$cur")" "$plain" "$MEMLIMIT_FILE"
+        memlimit_flag_bad "$cur" 1
+    else
+        cur=""
+        echo -e "内存软上限（GOMEMLIMIT）：${yellow}未设置${plain}（默认）"
+    fi
+    want=$(memlimit_effective) || want=""
+    ws="未设置"; [[ -n "$want" ]] && ws=$(memlimit_show_value "$want")
+    if [[ "$want" != "$cur" ]]; then
+        if memlimit_stale; then
+            # 文件改过，systemd 手里还是改之前的——不是别的 drop-in 设的。
+            printf '  %bsystemd 还没重新读取%b（上次 daemon-reload 没成功，或改完还没执行），它现在会给的仍是：%s\n' \
+                "$yellow" "$plain" "$ws"
+            if [[ -z "$cur" ]]; then
+                echo -e "  执行 ${green}systemctl daemon-reload${plain} 让它重读"
+            elif memlimit_bytes "$cur" >/dev/null; then
+                printf '  执行 %bsing2 memlimit %s%b 让它重读\n' "$green" "$cur" "$plain"
+            fi
+        elif [[ -n "$want" ]]; then
+            printf '  %bsystemd 实际会给：%s%b——来自另一个 drop-in 或 unit 本身，%bsystemctl cat %s%b 查看\n' \
+                "$yellow" "$ws" "$plain" "$green" "$SERVICE" "$plain"
+            memlimit_flag_bad "$want" 0
+        elif memlimit_bytes "$cur" >/dev/null; then
+            printf '  %bsystemd 没读到它%b——执行 %bsing2 memlimit %s%b（会重写这个文件、修好标签并让 systemd 重读）\n' \
+                "$yellow" "$plain" "$green" "$cur" "$plain"
+        else
+            echo -e "  ${yellow}systemd 没读到它${plain}——${green}systemctl cat ${SERVICE}${plain} 查看"
+        fi
+    fi
+    if pid=$(memlimit_main_pid); then
+        have=$(memlimit_running "$pid") || have=""
+        if [[ "$have" != "$want" ]]; then
+            hs="未设置"; [[ -n "$have" ]] && hs=$(memlimit_show_value "$have")
+            printf '  运行中的进程：%b%s%b——重启后才会变成 %s\n' "$yellow" "$hs" "$plain" "$ws"
+        fi
+    fi
+    # 不是本脚本写的文件：设置、取消都会被拒，上面已经说了怎么办。
+    memlimit_foreign || echo -e "  设置：${green}sing2 memlimit 1500MiB${plain}    取消：${green}sing2 memlimit off${plain}"
+    echo -e "  这是 Go 的软上限，不是硬上限：Go 运行时管理的内存（主要是堆）接近它时用 CPU 换内存，已在用的内存压不下来。"
+    echo -e "  进程 RSS 比这个值略高是正常的（二进制本身等不计入）。"
+    echo -e "  内存峰值没成问题就不必设；2 GB 的机器上 1400MiB～1500MiB 是合理的值；不要低于节点平稳运行时的需要（回收后的低点，不是峰值）。"
+}
+
+# 菜单状态区的一行：systemd 下次启动会给的值，括号里说它从哪来、是否待重启。
+# 只读，不修任何东西。
+show_memlimit_status() {
+    local cur want note="" c=$green own=0
+    cur=$(memlimit_configured) || cur=""
+    want=$(memlimit_effective) || want=""
+    if memlimit_foreign; then
+        # 文件不归本脚本管，它里面的值不按「本脚本的」来说，也不提示用 sing2 memlimit 重写。
+        [[ "$want" == "$cur" ]] && own=2
+        cur=""
+        note="（memlimit.conf 里有不是本脚本写的内容，详见 sing2 memlimit）"
+    elif [[ "$want" != "$cur" ]] && memlimit_stale; then
+        note="（systemd 还没重新读取，详见 sing2 memlimit）"
+    elif [[ -n "$cur" && -z "$want" ]]; then
+        note="（memlimit.conf 没被 systemd 读到，详见 sing2 memlimit）"
+    elif memlimit_pending; then
+        if [[ -z "$want" ]]; then
+            note="（已取消，重启后生效）"
+        elif [[ "$want" == "$cur" ]]; then
+            note="（已写入，重启后生效）"
+        else
+            note="（来自另一个 drop-in，重启后生效）"
+        fi
+    elif [[ -n "$want" && "$want" != "$cur" ]]; then
+        note="（来自另一个 drop-in）"
+    fi
+    [[ -n "$note" ]] && c=$yellow
+    if [[ -n "$want" ]]; then
+        printf '内存软上限: %b%s%b%s\n' "$c" "$(memlimit_show_value "$want")" "$plain" "$note"
+    else
+        echo -e "内存软上限: 未设置${note:-（默认）}"
+    fi
+    # 手改出来、脚本不认的值：重启后多半起不来，状态区就要看得见。
+    if ! memlimit_flag_bad "$cur" 1 && [[ "$want" != "$cur" ]]; then
+        memlimit_flag_bad "$want" "$own"
+    fi
+    return 0
+}
+
+# memlimit —— 查看 / 设置 / 取消内存软上限。
+#   sing2 memlimit            查看
+#   sing2 memlimit 1500MiB    设置
+#   sing2 memlimit off        取消
+# 改完只问、不自作主张地重启；非交互调用（stdin 不是终端）一律不重启。
+# 设置时有提醒（值偏低、偏高、没写单位……），「是否重启」默认答 n。
+memlimit() {
+    local cli=0 value rc def=y
+    if [[ $# -gt 0 ]]; then cli=1; shift; fi   # 去掉命令行标记位
+
+    if [[ $cli == 1 ]]; then
+        if [[ $# -gt 1 ]]; then
+            echo -e "${red}只接受一个取值${plain}，例如 ${green}sing2 memlimit 1500MiB${plain}"
+            return 2
+        fi
+        if [[ $# == 0 ]]; then
+            show_memlimit
+            return 0
+        fi
+        value=$1
+    else
+        show_memlimit
+        echo && echo -n "输入新值（如 1500MiB；off 取消上限；直接回车不改）: " && read -r value
+        value=$(memlimit_trim "$value")
+        if [[ -z "$value" ]]; then
+            echo -e "未做改动"
+            before_show_menu
+            return 0
+        fi
+    fi
+
+    set_memlimit "$value"
+    rc=$?
+    if [[ $rc == 1 || $rc == 4 ]]; then
+        [[ $cli == 0 ]] && before_show_menu
+        return "$rc"
+    fi
+
+    if ! memlimit_pending; then
+        # 没有待生效的变化：进程没在跑（下次启动自然用新值），或它拿到的已经是这个值。
+        [[ $rc == 0 ]] && ! memlimit_main_pid >/dev/null &&
+            echo -e "Sing2 当前未运行，下次启动时生效"
+        [[ $cli == 0 ]] && before_show_menu
+        return 0
+    fi
+    echo -e "${yellow}运行中的 Sing2 还在用旧值，重启后生效${plain}"
+    if (( ${MEMLIMIT_WARNED:-0} > 0 )); then
+        def=n
+        echo -e "上面有提醒，看过再决定——这次默认不重启"
+    fi
+    if [[ $cli == 0 ]]; then
+        confirm_restart "$def"
+    elif [[ -t 0 ]]; then
+        confirm_restart "$def" 0
+    else
+        echo -e "非交互调用，不自动重启：执行 ${green}sing2 restart${plain} 后生效"
+    fi
+    return 0
 }
 
 show_Sing2_version() {
@@ -947,6 +1565,8 @@ show_usage() {
     echo "sing2 update x.x.x - 更新到指定版本"
     echo "sing2 update -f    - 强制重装当前版本"
     echo "sing2 key          - 写入/轮换分发端点与密钥"
+    echo "sing2 memlimit     - 查看内存软上限（默认不设）"
+    echo "sing2 memlimit 值  - 设置内存软上限，如 1500MiB；off 取消"
     echo "sing2 install      - 安装"
     echo "sing2 uninstall    - 卸载"
     echo "sing2 version      - 查看版本"
@@ -979,9 +1599,10 @@ show_menu() {
  ${green}15.${plain} 放行 VPS 的所有网络端口
  ${green}16.${plain} 生成 REALITY 密钥对
  ${green}17.${plain} 写入/轮换分发端点与密钥
+ ${green}18.${plain} 设置内存软上限（GOMEMLIMIT）
  "
     show_status
-    echo && read -rp "请输入选择 [0-17]: " num
+    echo && read -rp "请输入选择 [0-18]: " num
 
     case "${num}" in
         0) config ;;
@@ -1003,7 +1624,8 @@ show_menu() {
         16) check_install && gen_x25519 ;;
         # 不加 check_install：装不上正是因为缺密钥，这时候要求「先装好」是死循环。
         17) dist_key ;;
-        *) echo -e "${red}请输入正确的数字 [0-17]${plain}" ;;
+        18) check_install && memlimit ;;
+        *) echo -e "${red}请输入正确的数字 [0-18]${plain}" ;;
     esac
 }
 
@@ -1021,6 +1643,7 @@ if [[ $# -gt 0 ]]; then
         "generate")  generate_config_file 0 ;;
         "x25519")    gen_x25519 0 ;;
         "key")       dist_key 0 ;;
+        "memlimit")  check_install 0 && memlimit 0 "${@:2}" ;;
         "install")   check_uninstall 0 && install 0 ;;
         "uninstall") check_install 0 && uninstall 0 ;;
         "version")   check_install 0 && show_Sing2_version 0 ;;
